@@ -1,14 +1,11 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v2.0.0)
-// Movies:  YTS (1080p, min 15 seeds)
-// Series:  Torrentio (aggregated, 1080p, min 3 seeds)
+// NUVIO TORRENTS — Cloudflare Worker Addon (v3.0.0)
+// Movies: YTS only (1080p, min 15 seeds)
+// Series: hindi supported (walang reliable na source)
 // ============================================================
 
-const TMDB_API_KEY = '1865f43a0549ca50d341dd9ab8b29f49';
 const YTS_API_BASE = 'https://movies-api.accel.li/api/v2';
-const TORRENTIO_API = 'https://torrentio.strem.fun';
 const MIN_SEEDS_MOVIE = 15;
-const MIN_SEEDS_SERIES = 3;
 const QUALITY_LABEL = '1080p';
 
 const HEADERS = {
@@ -39,12 +36,12 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '2.0.0',
+  version: '3.0.0',
   name: 'MobiFlix',
-  description: '1080p torrent magnet links — YTS (movies) + Torrentio (series).',
+  description: 'YTS movie torrents — 1080p, minimum 15 seeders.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
   author: 'Nuvio Team',
-  types: ['movie', 'series'],
+  types: ['movie'],
   idPrefixes: ['tt'],
   catalogs: [],
   resources: ['stream'],
@@ -63,20 +60,15 @@ function buildMagnet(hash, name) {
   return 'magnet:?xt=urn:btih:' + hash + dn + trackers;
 }
 
-function is1080p(filename) {
-  return /\b1080p\b|\bFHD\b/i.test(filename);
-}
-
-function parseSizeBytes(sizeStr) {
-  if (!sizeStr) return 0;
-  const m = String(sizeStr).match(/([0-9.]+)\s*([GMK]B?)/i);
+function parseSizeBytes(sizeStr, torrent) {
+  if (typeof torrent?.size === 'number' && torrent.size > 0) return Math.floor(torrent.size);
+  if (typeof torrent?.bytes === 'number' && torrent.bytes > 0) return Math.floor(torrent.bytes);
+  const m = String(sizeStr).match(/([0-9.]+)\s*([GM]B)/i);
   if (!m) return 0;
   const val = parseFloat(m[1]);
-  const unit = (m[2] || 'GB').toUpperCase();
-  if (unit.startsWith('T')) return Math.floor(val * 1099511627776);
-  if (unit.startsWith('G')) return Math.floor(val * 1073741824);
-  if (unit.startsWith('M')) return Math.floor(val * 1048576);
-  if (unit.startsWith('K')) return Math.floor(val * 1024);
+  const unit = m[2].toUpperCase();
+  if (unit === 'GB') return Math.floor(val * 1073741824);
+  if (unit === 'MB') return Math.floor(val * 1048576);
   return 0;
 }
 
@@ -91,6 +83,7 @@ async function fetchYTS(imdbId) {
       debug.error = 'no movies found';
       return { items: [], debug };
     }
+
     const out = [];
     for (const movie of data.data.movies) {
       for (const t of (movie.torrents || [])) {
@@ -103,7 +96,7 @@ async function fetchYTS(imdbId) {
           filename: movie.title + ' ' + t.quality,
           seeds,
           peers: parseInt(t.peers) || 0,
-          sizeBytes: parseSizeBytes(t.size),
+          sizeBytes: parseSizeBytes(t.size, t),
           magnet: buildMagnet(t.hash, movie.title)
         });
       }
@@ -116,89 +109,8 @@ async function fetchYTS(imdbId) {
   }
 }
 
-// ============ SOURCE: Torrentio (SERIES ONLY) ============
-async function fetchTorrentio(type, imdbId, season, episode) {
-  const debug = { source: 'Torrentio', url: '', count: 0, error: null, totalFetched: 0, reasonCount: {} };
-  try {
-    const id = season && episode ? `${imdbId}:${season}:${episode}` : imdbId;
-    const url = TORRENTIO_API + '/stream/' + type + '/' + id + '.json';
-    debug.url = url;
-
-    const data = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
-    if (!data?.streams || !Array.isArray(data.streams)) {
-      debug.error = 'no streams array';
-      return { items: [], debug };
-    }
-    debug.totalFetched = data.streams.length;
-
-    const out = [];
-    const reasonCount = { noFilename: 0, not1080p: 0, lowSeeds: 0, noHash: 0 };
-
-    for (const s of data.streams) {
-      // Torrentio returns: name, title, infoHash, fileIdx, behaviorHints.bingeGroup, sources
-      const infoHash = s.infoHash || (s.url && s.url.match(/btih:([a-f0-9]{40})/i)?.[1]);
-      if (!infoHash) { reasonCount.noHash++; continue; }
-
-      // Extract filename/title from Torrentio's "title" field
-      const filename = s.title || s.name || '';
-      if (!filename) { reasonCount.noFilename++; continue; }
-
-      // Check 1080p
-      if (!is1080p(filename)) { reasonCount.not1080p++; continue; }
-
-      // Extract seeders — Torrentio uses "seeders" field kung minsan, o nasa title
-      let seeds = parseInt(s.seeders) || 0;
-      if (!seeds) {
-        // Try to extract from title (hal. "👤 123")
-        const seedMatch = filename.match(/👤\s*(\d+)/);
-        if (seedMatch) seeds = parseInt(seedMatch[1]) || 0;
-      }
-      if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
-
-      // Extract size — Torrentio sometimes has "size" field, o nasa title (💾 1.23 GB)
-      let sizeBytes = 0;
-      if (s.size) sizeBytes = parseInt(s.size) || 0;
-      if (!sizeBytes) {
-        const sizeMatch = filename.match(/💾\s*([0-9.]+\s*[GMKT]B?)/i);
-        if (sizeMatch) sizeBytes = parseSizeBytes(sizeMatch[1]);
-      }
-
-      // Build magnet — gamitin ang Torrentio sources kung meron
-      let magnet;
-      if (s.infoHash) {
-        magnet = buildMagnet(s.infoHash, filename.replace(/^.*?\n/, '').trim());
-      } else if (s.url && s.url.startsWith('magnet:')) {
-        magnet = s.url;
-      } else {
-        magnet = buildMagnet(infoHash, filename);
-      }
-
-      // Extract clean filename from title (Torrentio includes emoji decorations)
-      const cleanName = filename.replace(/[^\w\s.\-\[\]()]/g, ' ').replace(/\s+/g, ' ').trim();
-
-      out.push({
-        source: 'Torrentio',
-        hash: infoHash.toLowerCase(),
-        filename: cleanName || filename,
-        seeds,
-        peers: 0,
-        sizeBytes,
-        magnet,
-        bingeGroup: s.behaviorHints?.bingeGroup || null
-      });
-    }
-
-    debug.reasonCount = reasonCount;
-    debug.count = out.length;
-    return { items: out, debug };
-  } catch (e) {
-    debug.error = e?.message || String(e);
-    return { items: [], debug };
-  }
-}
-
 // ============ BUILD STREAMS ============
-function buildStreams(items, title, year, isSeries, season, episode) {
+function buildStreams(items) {
   const seen = new Set();
   const unique = [];
   for (const item of items) {
@@ -221,23 +133,18 @@ function buildStreams(items, title, year, isSeries, season, episode) {
     if (/\bDTS\b/i.test(item.filename)) extras.push('DTS');
     if (/\b5\.1\b/i.test(item.filename)) extras.push('5.1');
 
-    const titleLine = isSeries
-      ? '🎬 ' + title + ' S' + String(season).padStart(2, '0') + ' E' + String(episode).padStart(2, '0')
-      : '🎬 ' + title + ' (' + year + ')';
+    const titleLine = '🎬 ' + item.filename;
     const qualityLine = '🔥 ' + QUALITY_LABEL + (extras.length ? ' | ' + extras.join(' | ') : '');
     const statsLine = '🌱 ' + item.seeds + ' | 💾 ' + sizeGB + ' GB | 🔗 ' + item.source;
     const description = titleLine + '\n' + qualityLine + '\n' + statsLine;
 
-    // Source label — mas maikli para sa Torrentio
-    const sourceLabel = item.source === 'Torrentio' ? 'Torrentio' : item.source;
-
     return {
-      name: sourceLabel + ' | ' + QUALITY_LABEL.toUpperCase() + ' | 🌱 ' + item.seeds,
+      name: item.source + ' | ' + QUALITY_LABEL.toUpperCase() + ' | 🌱 ' + item.seeds,
       title: description,
       description: description,
       url: item.magnet,
       behaviorHints: {
-        bingeGroup: item.bingeGroup || ('nuvio-torrents-' + item.source + '-1080p')
+        bingeGroup: 'nuvio-torrents-' + item.source + '-1080p'
       }
     };
   });
@@ -246,44 +153,26 @@ function buildStreams(items, title, year, isSeries, season, episode) {
 // ============ ID PARSER ============
 function parseId(id) {
   const parts = String(id).split(':');
-  const imdbId = parts[0];
-  let season = null, episode = null;
-  if (parts.length >= 3) {
-    season = parseInt(String(parts[1]).replace(/^S/i, ''));
-    episode = parseInt(String(parts[2]).replace(/^E/i, ''));
-  } else if (parts.length === 2) {
-    season = parseInt(String(parts[1]).replace(/^S/i, ''));
-  }
-  return { imdbId, season, episode };
+  return { imdbId: parts[0] };
 }
 
 // ============ STREAM HANDLER ============
 async function handleStream(type, id) {
-  const isSeries = type === 'series' || type === 'tv';
-  const { imdbId, season, episode } = parseId(id);
+  // Movies lang ang supported
+  if (type !== 'movie') {
+    return { streams: [], _debug: { error: 'series not supported', type, id } };
+  }
 
+  const { imdbId } = parseId(id);
   if (!imdbId || !/^tt\d+$/.test(imdbId)) {
     return { streams: [], _debug: { error: 'invalid imdb', id } };
   }
 
-  const allDebug = { type, id, imdbId, season, episode, sources: [] };
+  const allDebug = { type, id, imdbId, sources: [] };
+  const ytsResult = await fetchYTS(imdbId);
+  allDebug.sources.push(ytsResult.debug);
 
-  // 🎬 MOVIES → YTS lang
-  if (!isSeries) {
-    const ytsResult = await fetchYTS(imdbId);
-    allDebug.sources.push(ytsResult.debug);
-    const streams = buildStreams(ytsResult.items, 'Movie', 'N/A', false, null, null);
-    return { streams, _debug: allDebug };
-  }
-
-  // 📺 SERIES → Torrentio lang
-  if (!season || !episode) {
-    return { streams: [], _debug: { ...allDebug, error: 'missing season/episode' } };
-  }
-
-  const tioResult = await fetchTorrentio('series', imdbId, season, episode);
-  allDebug.sources.push(tioResult.debug);
-  const streams = buildStreams(tioResult.items, 'Series', 'N/A', true, season, episode);
+  const streams = buildStreams(ytsResult.items);
   return { streams, _debug: allDebug };
 }
 
