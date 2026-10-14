@@ -1,7 +1,7 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v1.4.1)
+// NUVIO TORRENTS — Cloudflare Worker Addon (v1.5.0)
 // Movies:  YTS
-// Series:  EZTV + 1337x (apibay) + ThePirateBay (apibay) + Knaben
+// Series:  EZTV + 1337x + ThePirateBay + SolidTorrents
 // ============================================================
 
 const TMDB_API_KEY = '1865f43a0549ca50d341dd9ab8b29f49';
@@ -38,9 +38,9 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '1.4.1',
+  version: '1.5.0',
   name: 'MobiFlix',
-  description: '1080p torrent magnet links — YTS + EZTV + 1337x + ThePirateBay + Knaben.',
+  description: '1080p torrent magnet links — YTS + EZTV + 1337x + ThePirateBay + SolidTorrents.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
   author: 'Nuvio Team',
   types: ['movie', 'series'],
@@ -313,68 +313,52 @@ async function fetchTPB(title, season, episode) {
   }
 }
 
-// ============ SOURCE: Knaben (aggregator, hindi apibay) ============
-async function fetchKnaben(title, season, episode) {
-  const debug = { source: 'Knaben', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0, sample: [] };
+// ============ SOURCE: SolidTorrents ============
+async function fetchSolidTorrents(title, season, episode) {
+  const debug = { source: 'SolidTorrents', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0, sample: [] };
   try {
     const s = String(season).padStart(2, '0');
     const e = String(episode).padStart(2, '0');
     const queries = [
       title + ' S' + s + 'E' + e + ' 1080p',
-      title + ' S' + s + 'E' + e,
-      title + ' 1080p S' + s
+      title + ' S' + s + 'E' + e
     ];
 
     const seen = new Set();
     const all = [];
 
     for (const q of queries) {
-      try {
-        const url = 'https://api.knaben.org/v1';
-        debug.urls.push(url + ' [q=' + q + ']');
+      const endpoints = [
+        'https://solidtorrents.to/api/v1/search?q=' + encodeURIComponent(q) + '&sort=seeders',
+        'https://solidtorrents.net/api/v1/search?q=' + encodeURIComponent(q) + '&sort=seeders'
+      ];
+      for (const url of endpoints) {
+        try {
+          debug.urls.push(url);
+          const res = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
+          const results = res?.results || [];
+          debug.rawCounts.push({ q, url, count: results.length });
 
-        const body = JSON.stringify({
-          search_type: 'score',
-          search_field: 'title',
-          query: q,
-          order_by: 'seeders',
-          order_direction: 'desc',
-          size: 50,
-          hide_unsafe: true,
-          hide_xxx: true
-        });
-
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: {
-            ...HEADERS,
-            'Content-Type': 'application/json'
-          },
-          body
-        }).then(r => r.json()).catch(() => null);
-
-        const hits = res?.hits || [];
-        debug.rawCounts.push({ q, count: hits.length });
-
-        for (const h of hits) {
-          const hash = (h.hash || '').toLowerCase();
-          if (!hash || hash.length !== 40 || seen.has(hash)) continue;
-          seen.add(hash);
-          all.push({
-            name: h.title || '',
-            info_hash: hash,
-            seeders: String(h.seeders || 0),
-            leechers: String(h.peers || 0),
-            size: String(h.bytes || 0)
-          });
+          for (const r of results) {
+            const hash = (r.infohash || r.infoHash || '').toLowerCase();
+            if (!hash || hash.length !== 40 || seen.has(hash)) continue;
+            seen.add(hash);
+            all.push({
+              name: r.title || r.name || '',
+              info_hash: hash,
+              seeders: String(r.swarm?.seeders ?? r.seeders ?? 0),
+              leechers: String(r.swarm?.leechers ?? r.leechers ?? 0),
+              size: String(r.size ?? 0)
+            });
+          }
+          if (results.length > 0) break; // kung may results na, huwag nang subukan ibang endpoint
+        } catch (err) {
+          debug.rawCounts.push({ q, url, error: err.message });
         }
-      } catch (err) {
-        debug.rawCounts.push({ q, error: err.message });
       }
     }
     debug.totalFetched = all.length;
 
-    // Sample para makita natin ang structure
     debug.sample = all.slice(0, 5).map(t => ({
       name: (t.name || '').substring(0, 90),
       seeds: t.seeders,
@@ -394,7 +378,7 @@ async function fetchKnaben(title, season, episode) {
       const matched = tWords.filter(w => nameNorm.includes(w));
       if (matched.length < 1) { reasonCount.titleMismatch++; continue; }
       out.push({
-        source: 'Knaben',
+        source: 'SolidTorrents',
         hash: t.info_hash,
         filename: t.name,
         seeds,
@@ -535,7 +519,7 @@ async function handleStream(type, id) {
     promises.push(fetchEztv(imdbId, season, episode));
     promises.push(fetch1337x(meta.title, season, episode));
     promises.push(fetchTPB(meta.title, season, episode));
-    promises.push(fetchKnaben(meta.title, season, episode));
+    promises.push(fetchSolidTorrents(meta.title, season, episode));
   } else {
     return { streams: [], _debug: { ...allDebug, error: 'missing season/episode' } };
   }
