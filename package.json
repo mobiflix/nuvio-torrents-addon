@@ -1,0 +1,15 @@
+{
+  "name": "nuvio-torrents",
+  "version": "1.0.0",
+  "description": "Nuvio Torrents — Cloudflare Worker addon for Stremio/Nuvio",
+  "main": "worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  },
+  "author": "Nuvio Team",
+  "license": "MIT"
+}

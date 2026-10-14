@@ -1,0 +1,340 @@
+// ============================================================
+// NUVIO TORRENTS — Cloudflare Worker Addon
+// Sources: YTS + EZTV + 1337x (via apibay)
+// Quality: 1080p only | Min 15 seeders
+// ============================================================
+
+const TMDB_API_KEY = '1865f43a0549ca50d341dd9ab8b29f49';
+const YTS_API_BASE = 'https://movies-api.accel.li/api/v2';
+const MIN_SEEDS = 15;
+const QUALITY_LABEL = '1080p';
+
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+  'Accept': 'application/json'
+};
+
+const TRACKERS = [
+  'udp://tracker.opentrackr.org:1337/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://tracker.dler.org:6969/announce',
+  'udp://open.stealth.si:80/announce',
+  'udp://open.demonii.com:1337/announce',
+  'https://tracker.moeblog.cn:443/announce',
+  'udp://open.dstud.io:6969/announce',
+  'udp://tracker.srv00.com:6969/announce',
+  'https://tracker.zhuqiy.com:443/announce',
+  'https://tracker.pmman.tech:443/announce'
+];
+
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+  'Access-Control-Allow-Headers': '*',
+  'Content-Type': 'application/json'
+};
+
+// ============ MANIFEST ============
+const MANIFEST = {
+  id: 'community.nuvio.torrents',
+  version: '1.0.0',
+  name: 'Nuvio Torrents',
+  description: '1080p torrent magnet links — YTS + EZTV + 1337x. Movies at series. Minimum 15 seeders.',
+  logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
+  author: 'Nuvio Team',
+  types: ['movie', 'series'],
+  idPrefixes: ['tt'],
+  catalogs: [],
+  resources: ['stream'],
+  behaviorHints: {
+    configurable: false,
+    configurationRequired: false,
+    logging: false
+  }
+};
+
+// ============ HELPERS ============
+function buildMagnet(hash, name) {
+  if (!hash) return '';
+  const trackers = TRACKERS.map(t => '&tr=' + encodeURIComponent(t)).join('');
+  const dn = name ? '&dn=' + encodeURIComponent(name) : '';
+  return 'magnet:?xt=urn:btih:' + hash + dn + trackers;
+}
+
+function normalizeTitle(title) {
+  if (!title) return '';
+  return String(title).replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function titleWords(title) {
+  return normalizeTitle(title).split(/\s+/).filter(w => w.length > 2);
+}
+
+function buildSePatterns(season, episode) {
+  const s = String(season), e = String(episode);
+  const sPad = s.padStart(2, '0'), ePad = e.padStart(2, '0');
+  return [
+    new RegExp('S' + sPad + '[\\s._-]?E' + ePad, 'i'),
+    new RegExp('\\b' + s + 'x' + ePad + '\\b', 'i'),
+    new RegExp('Season[\\s._-]?' + s + '[\\s._-]?Episode[\\s._-]?' + e, 'i'),
+    new RegExp('S' + sPad + '[\\s._-]?' + ePad, 'i'),
+    new RegExp('\\b' + sPad + ePad + '\\b', 'i')
+  ];
+}
+
+function matchesSe(name, season, episode) {
+  return buildSePatterns(season, episode).some(p => p.test(name));
+}
+
+function is1080p(filename) {
+  return /\b1080p\b|\bFHD\b/i.test(filename);
+}
+
+function parseSizeBytes(sizeStr, torrent) {
+  if (typeof torrent?.size === 'number' && torrent.size > 0) return Math.floor(torrent.size);
+  if (typeof torrent?.bytes === 'number' && torrent.bytes > 0) return Math.floor(torrent.bytes);
+  const m = String(sizeStr).match(/([0-9.]+)\s*([GM]B)/i);
+  if (!m) return 0;
+  const val = parseFloat(m[1]);
+  const unit = m[2].toUpperCase();
+  if (unit === 'GB') return Math.floor(val * 1073741824);
+  if (unit === 'MB') return Math.floor(val * 1048576);
+  return 0;
+}
+
+// ============ SOURCE: YTS ============
+async function fetchYTS(imdbId) {
+  try {
+    const url = YTS_API_BASE + '/list_movies.json?query_term=' + encodeURIComponent(imdbId);
+    const data = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
+    if (!data?.data?.movies?.length) return [];
+
+    const out = [];
+    for (const movie of data.data.movies) {
+      for (const t of (movie.torrents || [])) {
+        if (t.quality !== '1080p') continue;
+        const seeds = parseInt(t.seeds) || 0;
+        if (seeds < MIN_SEEDS) continue;
+        out.push({
+          source: 'YTS',
+          hash: t.hash,
+          filename: movie.title + ' ' + t.quality,
+          seeds,
+          peers: parseInt(t.peers) || 0,
+          sizeBytes: parseSizeBytes(t.size, t),
+          magnet: buildMagnet(t.hash, movie.title)
+        });
+      }
+    }
+    return out;
+  } catch (e) {
+    console.error('[YTS] error:', e?.message || e);
+    return [];
+  }
+}
+
+// ============ SOURCE: EZTV ============
+async function fetchEztv(imdbId, season, episode) {
+  try {
+    const url = 'https://eztvx.to/api/get-torrents?imdb_id=' + imdbId + '&limit=100';
+    const data = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
+    if (!data?.torrents || !Array.isArray(data.torrents)) return [];
+
+    const out = [];
+    for (const t of data.torrents) {
+      if (!t?.hash || !t?.filename) continue;
+      if (String(t.season) !== String(season) || String(t.episode) !== String(episode)) continue;
+      if (!is1080p(t.filename)) continue;
+      const seeds = parseInt(t.seeds) || 0;
+      if (seeds < MIN_SEEDS) continue;
+      out.push({
+        source: 'EZTV',
+        hash: t.hash,
+        filename: t.filename,
+        seeds,
+        peers: parseInt(t.peers) || 0,
+        sizeBytes: parseInt(t.size_bytes) || 0,
+        magnet: t.magnet_url || buildMagnet(t.hash, t.filename)
+      });
+    }
+    return out;
+  } catch (e) {
+    console.error('[EZTV] error:', e?.message || e);
+    return [];
+  }
+}
+
+// ============ SOURCE: 1337x (via apibay) ============
+async function fetch1337x(title, season, episode) {
+  try {
+    const queries = [
+      title + ' S' + String(season).padStart(2, '0') + 'E' + String(episode).padStart(2, '0') + ' 1080p',
+      title + ' S' + String(season).padStart(2, '0') + 'E' + String(episode).padStart(2, '0') + ' x265'
+    ];
+    const seen = new Set();
+    const all = [];
+    for (const q of queries) {
+      try {
+        const url = 'https://apibay.org/q.php?q=' + encodeURIComponent(q) + '&cat=0';
+        const arr = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
+        if (Array.isArray(arr)) {
+          for (const t of arr) {
+            if (t && t.info_hash && !seen.has(t.info_hash) && t.info_hash !== '0000000000000000000000000000000000000000') {
+              seen.add(t.info_hash);
+              all.push(t);
+            }
+          }
+        }
+      } catch (_) {}
+    }
+
+    const out = [];
+    const tWords = titleWords(title);
+    for (const t of all) {
+      if (!matchesSe(t.name, season, episode)) continue;
+      if (!is1080p(t.name)) continue;
+      const seeds = parseInt(t.seeders) || 0;
+      if (seeds < MIN_SEEDS) continue;
+      const nameNorm = normalizeTitle(t.name);
+      const matched = tWords.filter(w => nameNorm.includes(w));
+      if (matched.length < Math.max(1, Math.floor(tWords.length * 0.5))) continue;
+
+      out.push({
+        source: '1337x',
+        hash: t.info_hash,
+        filename: t.name,
+        seeds,
+        peers: parseInt(t.leechers) || 0,
+        sizeBytes: parseInt(t.size) || 0,
+        magnet: buildMagnet(t.info_hash, t.name)
+      });
+    }
+    return out;
+  } catch (e) {
+    console.error('[1337x] error:', e?.message || e);
+    return [];
+  }
+}
+
+// ============ TMDB LOOKUP ============
+async function lookupTmdb(imdbId, isSeries) {
+  try {
+    const url = 'https://api.themoviedb.org/3/find/' + imdbId +
+      '?api_key=' + TMDB_API_KEY + '&external_source=imdb_id';
+    const data = await fetch(url).then(r => r.json()).catch(() => null);
+    if (!data) return { title: 'Unknown', year: 'N/A', imdbId };
+    const item = isSeries
+      ? (data.tv_results && data.tv_results[0])
+      : (data.movie_results && data.movie_results[0]);
+    if (!item) return { title: 'Unknown', year: 'N/A', imdbId };
+    return {
+      title: item.title || item.name || 'Unknown',
+      year: (item.release_date || item.first_air_date || 'N/A').split('-')[0],
+      imdbId
+    };
+  } catch (e) {
+    return { title: 'Unknown', year: 'N/A', imdbId };
+  }
+}
+
+// ============ BUILD STREAMS ============
+function buildStreams(items, title, year, isSeries, season, episode) {
+  const seen = new Set();
+  const unique = [];
+  for (const item of items) {
+    if (!item.hash || seen.has(item.hash)) continue;
+    seen.add(item.hash);
+    unique.push(item);
+  }
+  if (!unique.length) return [];
+
+  unique.sort((a, b) => b.seeds - a.seeds || a.sizeBytes - b.sizeBytes);
+
+  return unique.map(item => {
+    const sizeGB = (item.sizeBytes / 1073741824).toFixed(2);
+    const extras = [];
+    if (/\bX265\b|\bH\.?265\b|\bHEVC\b/i.test(item.filename)) extras.push('X265');
+    else if (/\bX264\b|\bH\.?264\b|\bAVC\b/i.test(item.filename)) extras.push('X264');
+    if (/\bHDR10\+?\b/i.test(item.filename)) extras.push('HDR10');
+    else if (/\bHDR\b/i.test(item.filename)) extras.push('HDR');
+    if (/\bATMOS\b/i.test(item.filename)) extras.push('ATMOS');
+    if (/\bDTS\b/i.test(item.filename)) extras.push('DTS');
+    if (/\b5\.1\b/i.test(item.filename)) extras.push('5.1');
+
+    const titleLine = isSeries
+      ? '🎬 ' + title + ' S' + String(season).padStart(2, '0') + ' E' + String(episode).padStart(2, '0')
+      : '🎬 ' + title + ' (' + year + ')';
+    const qualityLine = '🔥 ' + QUALITY_LABEL + (extras.length ? ' | ' + extras.join(' | ') : '');
+    const statsLine = '🌱 ' + item.seeds + ' | 💾 ' + sizeGB + ' GB | 🔗 ' + item.source;
+    const description = titleLine + '\n' + qualityLine + '\n' + statsLine;
+
+    return {
+      name: item.source + ' | ' + QUALITY_LABEL.toUpperCase() + ' | 🌱 ' + item.seeds,
+      title: description,
+      description: description,
+      url: item.magnet,
+      behaviorHints: {
+        bingeGroup: 'nuvio-torrents-' + item.source + '-1080p'
+      }
+    };
+  });
+}
+
+// ============ STREAM HANDLER ============
+async function handleStream(type, id) {
+  const parts = String(id).split(':');
+  const imdbId = parts[0];
+  const isSeries = type === 'series' || type === 'tv';
+  const season = parts[1] ? parseInt(parts[1]) : null;
+  const episode = parts[2] ? parseInt(parts[2]) : null;
+
+  if (!imdbId || !/^tt\d+$/.test(imdbId)) return { streams: [] };
+
+  const meta = await lookupTmdb(imdbId, isSeries);
+  if (meta.title === 'Unknown' && !isSeries) return { streams: [] };
+
+  const promises = [fetchYTS(imdbId)];
+  if (isSeries && season && episode) {
+    promises.push(fetchEztv(imdbId, season, episode));
+    promises.push(fetch1337x(meta.title, season, episode));
+  }
+
+  const settled = await Promise.allSettled(promises);
+  const merged = [];
+  for (const s of settled) {
+    if (s.status === 'fulfilled' && Array.isArray(s.value)) merged.push(...s.value);
+  }
+
+  const streams = buildStreams(merged, meta.title, meta.year, isSeries, season, episode);
+  return { streams };
+}
+
+// ============ ROUTER ============
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS });
+    }
+
+    if (path === '/manifest.json' || path === '/') {
+      return new Response(JSON.stringify(MANIFEST), { headers: CORS });
+    }
+
+    const streamMatch = path.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
+    if (streamMatch) {
+      const type = streamMatch[1];
+      const id = decodeURIComponent(streamMatch[2]);
+      try {
+        const result = await handleStream(type, id);
+        return new Response(JSON.stringify(result), { headers: CORS });
+      } catch (e) {
+        return new Response(JSON.stringify({ streams: [], error: e.message }), { headers: CORS });
+      }
+    }
+
+    return new Response(JSON.stringify({ error: 'Not found' }), { status: 404, headers: CORS });
+  }
+};
