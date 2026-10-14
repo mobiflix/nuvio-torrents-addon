@@ -1,13 +1,12 @@
 // ============================================================
 // NUVIO TORRENTS — Cloudflare Worker Addon
-// Sources: YTS + EZTV + 1337x + The Pirate Bay
-// Quality: 1080p only | Min 15 seeders | Max 3GB
+// Sources: YTS + EZTV + 1337x (via apibay)
+// Quality: 1080p only | Min 15 seeders
 // ============================================================
 
 const TMDB_API_KEY = '1865f43a0549ca50d341dd9ab8b29f49';
 const YTS_API_BASE = 'https://movies-api.accel.li/api/v2';
 const MIN_SEEDS = 15;
-const MAX_SIZE_BYTES = 3 * 1073741824; // 3 GB — mababa lang ang size
 const QUALITY_LABEL = '1080p';
 
 const HEADERS = {
@@ -38,9 +37,9 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '1.1.0',
+  version: '1.0.0',
   name: 'MobiFlix',
-  description: '1080p torrent magnet links — YTS + EZTV + 1337x + The Pirate Bay. Movies at series. Minimum 15 seeders, max 3GB.',
+  description: '1080p torrent magnet links — YTS + EZTV + 1337x. Movies at series. Minimum 15 seeders.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
   author: 'Nuvio Team',
   types: ['movie', 'series'],
@@ -103,12 +102,7 @@ function parseSizeBytes(sizeStr, torrent) {
   return 0;
 }
 
-function isUnderMaxSize(sizeBytes) {
-  if (!sizeBytes || sizeBytes <= 0) return true; // kung walang size info, hayaan
-  return sizeBytes <= MAX_SIZE_BYTES;
-}
-
-// ============ SOURCE: YTS (PRIORITY FOR MOVIES) ============
+// ============ SOURCE: YTS ============
 async function fetchYTS(imdbId) {
   try {
     const url = YTS_API_BASE + '/list_movies.json?query_term=' + encodeURIComponent(imdbId);
@@ -121,15 +115,13 @@ async function fetchYTS(imdbId) {
         if (t.quality !== '1080p') continue;
         const seeds = parseInt(t.seeds) || 0;
         if (seeds < MIN_SEEDS) continue;
-        const sizeBytes = parseSizeBytes(t.size, t);
-        if (!isUnderMaxSize(sizeBytes)) continue;
         out.push({
           source: 'YTS',
           hash: t.hash,
           filename: movie.title + ' ' + t.quality,
           seeds,
           peers: parseInt(t.peers) || 0,
-          sizeBytes,
+          sizeBytes: parseSizeBytes(t.size, t),
           magnet: buildMagnet(t.hash, movie.title)
         });
       }
@@ -155,15 +147,13 @@ async function fetchEztv(imdbId, season, episode) {
       if (!is1080p(t.filename)) continue;
       const seeds = parseInt(t.seeds) || 0;
       if (seeds < MIN_SEEDS) continue;
-      const sizeBytes = parseInt(t.size_bytes) || 0;
-      if (!isUnderMaxSize(sizeBytes)) continue;
       out.push({
         source: 'EZTV',
         hash: t.hash,
         filename: t.filename,
         seeds,
         peers: parseInt(t.peers) || 0,
-        sizeBytes,
+        sizeBytes: parseInt(t.size_bytes) || 0,
         magnet: t.magnet_url || buildMagnet(t.hash, t.filename)
       });
     }
@@ -205,8 +195,6 @@ async function fetch1337x(title, season, episode) {
       if (!is1080p(t.name)) continue;
       const seeds = parseInt(t.seeders) || 0;
       if (seeds < MIN_SEEDS) continue;
-      const sizeBytes = parseInt(t.size) || 0;
-      if (!isUnderMaxSize(sizeBytes)) continue;
       const nameNorm = normalizeTitle(t.name);
       const matched = tWords.filter(w => nameNorm.includes(w));
       if (matched.length < Math.max(1, Math.floor(tWords.length * 0.5))) continue;
@@ -217,87 +205,13 @@ async function fetch1337x(title, season, episode) {
         filename: t.name,
         seeds,
         peers: parseInt(t.leechers) || 0,
-        sizeBytes,
+        sizeBytes: parseInt(t.size) || 0,
         magnet: buildMagnet(t.info_hash, t.name)
       });
     }
     return out;
   } catch (e) {
     console.error('[1337x] error:', e?.message || e);
-    return [];
-  }
-}
-
-// ============ SOURCE: THE PIRATE BAY (BACKUP) ============
-async function fetchTPB(title, year, isSeries, season, episode) {
-  try {
-    // Gumawa ng queries — movies at series
-    const queries = [];
-    if (isSeries && season && episode) {
-      queries.push(title + ' S' + String(season).padStart(2, '0') + 'E' + String(episode).padStart(2, '0') + ' 1080p');
-      queries.push(title + ' S' + String(season).padStart(2, '0') + 'E' + String(episode).padStart(2, '0') + ' x265');
-    } else {
-      if (year && year !== 'N/A') queries.push(title + ' ' + year + ' 1080p');
-      queries.push(title + ' 1080p');
-    }
-
-    const seen = new Set();
-    const all = [];
-    for (const q of queries) {
-      try {
-        // cat=0 = all, cat=201 = movies, cat=205 = tv
-        const cat = isSeries ? 205 : 201;
-        const url = 'https://apibay.org/q.php?q=' + encodeURIComponent(q) + '&cat=' + cat;
-        const arr = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
-        if (Array.isArray(arr)) {
-          for (const t of arr) {
-            if (t && t.info_hash && !seen.has(t.info_hash) &&
-                t.info_hash !== '0000000000000000000000000000000000000000') {
-              seen.add(t.info_hash);
-              all.push(t);
-            }
-          }
-        }
-      } catch (_) {}
-    }
-
-    const out = [];
-    const tWords = titleWords(title);
-    for (const t of all) {
-      if (!t.name) continue;
-      if (!is1080p(t.name)) continue;
-
-      // Series: siguraduhing tama ang S/E
-      if (isSeries && season && episode) {
-        if (!matchesSe(t.name, season, episode)) continue;
-      }
-
-      // Movies: siguraduhing tugma ang title (50% ng words)
-      if (!isSeries) {
-        const nameNorm = normalizeTitle(t.name);
-        const matched = tWords.filter(w => nameNorm.includes(w));
-        if (matched.length < Math.max(1, Math.floor(tWords.length * 0.5))) continue;
-      }
-
-      const seeds = parseInt(t.seeders) || 0;
-      if (seeds < MIN_SEEDS) continue;
-
-      const sizeBytes = parseInt(t.size) || 0;
-      if (!isUnderMaxSize(sizeBytes)) continue;
-
-      out.push({
-        source: 'TPB',
-        hash: t.info_hash,
-        filename: t.name,
-        seeds,
-        peers: parseInt(t.leechers) || 0,
-        sizeBytes,
-        magnet: buildMagnet(t.info_hash, t.name)
-      });
-    }
-    return out;
-  } catch (e) {
-    console.error('[TPB] error:', e?.message || e);
     return [];
   }
 }
@@ -324,7 +238,7 @@ async function lookupTmdb(imdbId, isSeries) {
 }
 
 // ============ BUILD STREAMS ============
-function buildStreams(items, title, year, isSeries, season, episode, prioritizeSource) {
+function buildStreams(items, title, year, isSeries, season, episode) {
   const seen = new Set();
   const unique = [];
   for (const item of items) {
@@ -334,16 +248,7 @@ function buildStreams(items, title, year, isSeries, season, episode, prioritizeS
   }
   if (!unique.length) return [];
 
-  unique.sort((a, b) => {
-    // Priority source muna (YTS for movies)
-    if (prioritizeSource) {
-      const aP = a.source === prioritizeSource ? 0 : 1;
-      const bP = b.source === prioritizeSource ? 0 : 1;
-      if (aP !== bP) return aP - bP;
-    }
-    // Tapos seeders
-    return b.seeds - a.seeds || a.sizeBytes - b.sizeBytes;
-  });
+  unique.sort((a, b) => b.seeds - a.seeds || a.sizeBytes - b.sizeBytes);
 
   return unique.map(item => {
     const sizeGB = (item.sizeBytes / 1073741824).toFixed(2);
@@ -388,18 +293,10 @@ async function handleStream(type, id) {
   const meta = await lookupTmdb(imdbId, isSeries);
   if (meta.title === 'Unknown' && !isSeries) return { streams: [] };
 
-  const promises = [];
-
+  const promises = [fetchYTS(imdbId)];
   if (isSeries && season && episode) {
-    // Series: lahat ng sources
-    promises.push(fetchYTS(imdbId));
     promises.push(fetchEztv(imdbId, season, episode));
     promises.push(fetch1337x(meta.title, season, episode));
-    promises.push(fetchTPB(meta.title, meta.year, true, season, episode));
-  } else {
-    // Movies: YTS priority + TPB backup
-    promises.push(fetchYTS(imdbId));
-    promises.push(fetchTPB(meta.title, meta.year, false, null, null));
   }
 
   const settled = await Promise.allSettled(promises);
@@ -408,9 +305,7 @@ async function handleStream(type, id) {
     if (s.status === 'fulfilled' && Array.isArray(s.value)) merged.push(...s.value);
   }
 
-  // Priority: YTS for movies
-  const prioritize = isSeries ? null : 'YTS';
-  const streams = buildStreams(merged, meta.title, meta.year, isSeries, season, episode, prioritize);
+  const streams = buildStreams(merged, meta.title, meta.year, isSeries, season, episode);
   return { streams };
 }
 
