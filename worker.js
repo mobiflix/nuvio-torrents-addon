@@ -1,7 +1,7 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v1.2.0)
-// Sources: YTS + EZTV + 1337x (via apibay)
-// Quality: 1080p only
+// NUVIO TORRENTS — Cloudflare Worker Addon (v1.3.0)
+// Movies:  YTS (1080p, min 15 seeds)
+// Series:  EZTV + 1337x + ThePirateBay (1080p, min 3 seeds)
 // ============================================================
 
 const TMDB_API_KEY = '1865f43a0549ca50d341dd9ab8b29f49';
@@ -38,9 +38,9 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '1.2.0',
+  version: '1.3.0',
   name: 'MobiFlix',
-  description: '1080p torrent magnet links — YTS + EZTV + 1337x.',
+  description: '1080p torrent magnet links — YTS + EZTV + 1337x + ThePirateBay.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
   author: 'Nuvio Team',
   types: ['movie', 'series'],
@@ -103,7 +103,7 @@ function parseSizeBytes(sizeStr, torrent) {
   return 0;
 }
 
-// ============ SOURCE: YTS ============
+// ============ SOURCE: YTS (MOVIES ONLY) ============
 async function fetchYTS(imdbId) {
   const debug = { source: 'YTS', url: '', count: 0, error: null };
   try {
@@ -153,8 +153,6 @@ async function fetchEztv(imdbId, season, episode) {
       return { items: [], debug };
     }
     debug.totalFetched = data.torrents.length;
-
-    // Sample para makita natin ang structure
     debug.sample = data.torrents.slice(0, 3).map(t => ({
       filename: t.filename,
       season: t.season,
@@ -164,15 +162,13 @@ async function fetchEztv(imdbId, season, episode) {
     }));
 
     const out = [];
-    let reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0 };
+    const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0 };
     for (const t of data.torrents) {
       if (!t?.hash || !t?.filename) continue;
-
       const tSeason = parseInt(t.season) || 0;
       const tEpisode = parseInt(t.episode) || 0;
       if (tSeason !== season || tEpisode !== episode) { reasonCount.seMismatch++; continue; }
       if (!is1080p(t.filename)) { reasonCount.not1080p++; continue; }
-
       const seeds = parseInt(t.seeds) || 0;
       if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
 
@@ -232,7 +228,7 @@ async function fetch1337x(title, season, episode) {
 
     const out = [];
     const tWords = titleWords(title);
-    let reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0, titleMismatch: 0 };
+    const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0, titleMismatch: 0 };
     for (const t of all) {
       if (!matchesSe(t.name, season, episode)) { reasonCount.seMismatch++; continue; }
       if (!is1080p(t.name)) { reasonCount.not1080p++; continue; }
@@ -261,6 +257,74 @@ async function fetch1337x(title, season, episode) {
   }
 }
 
+// ============ SOURCE: ThePirateBay (via apibay) ============
+async function fetchTPB(title, season, episode) {
+  const debug = { source: 'ThePirateBay', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0 };
+  try {
+    const s = String(season).padStart(2, '0');
+    const e = String(episode).padStart(2, '0');
+    // TPB ay mas effective sa mas simpleng query — marami itong re-release ng TV packs
+    const queries = [
+      title + ' S' + s + 'E' + e + ' 1080p',
+      title + ' S' + s + 'E' + e,
+      title + ' S' + s + ' 1080p',      // season pack (minsan kasama ep)
+      title + ' ' + s + 'x' + e + ' 1080p',
+      title + ' ' + season + 'x' + e
+    ];
+    const seen = new Set();
+    const all = [];
+    for (const q of queries) {
+      try {
+        const url = 'https://apibay.org/q.php?q=' + encodeURIComponent(q) + '&cat=0';
+        debug.urls.push(url);
+        const arr = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
+        const count = Array.isArray(arr) ? arr.length : 0;
+        debug.rawCounts.push({ q, count });
+        if (Array.isArray(arr)) {
+          for (const t of arr) {
+            if (t && t.info_hash && !seen.has(t.info_hash) && t.info_hash !== '0000000000000000000000000000000000000000') {
+              seen.add(t.info_hash);
+              all.push(t);
+            }
+          }
+        }
+      } catch (err) {
+        debug.rawCounts.push({ q, error: err.message });
+      }
+    }
+    debug.totalFetched = all.length;
+
+    const out = [];
+    const tWords = titleWords(title);
+    const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0, titleMismatch: 0 };
+    for (const t of all) {
+      if (!matchesSe(t.name, season, episode)) { reasonCount.seMismatch++; continue; }
+      if (!is1080p(t.name)) { reasonCount.not1080p++; continue; }
+      const seeds = parseInt(t.seeders) || 0;
+      if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
+      const nameNorm = normalizeTitle(t.name);
+      const matched = tWords.filter(w => nameNorm.includes(w));
+      if (matched.length < Math.max(1, Math.floor(tWords.length * 0.4))) { reasonCount.titleMismatch++; continue; }
+
+      out.push({
+        source: 'ThePirateBay',
+        hash: t.info_hash,
+        filename: t.name,
+        seeds,
+        peers: parseInt(t.leechers) || 0,
+        sizeBytes: parseInt(t.size) || 0,
+        magnet: buildMagnet(t.info_hash, t.name)
+      });
+    }
+    debug.reasonCount = reasonCount;
+    debug.count = out.length;
+    return { items: out, debug };
+  } catch (e) {
+    debug.error = e?.message || String(e);
+    return { items: [], debug };
+  }
+}
+
 // ============ TMDB LOOKUP (may episode-ID fallback) ============
 async function lookupTmdb(imdbId, isSeries) {
   try {
@@ -270,7 +334,6 @@ async function lookupTmdb(imdbId, isSeries) {
     if (!data) return { title: 'Unknown', year: 'N/A', imdbId };
 
     if (isSeries) {
-      // Normal case: series ID
       if (data.tv_results && data.tv_results[0]) {
         const item = data.tv_results[0];
         return {
@@ -279,7 +342,6 @@ async function lookupTmdb(imdbId, isSeries) {
           imdbId
         };
       }
-      // Fallback: episode ID → kunin ang show
       if (data.tv_episode_results && data.tv_episode_results[0]) {
         const ep = data.tv_episode_results[0];
         if (ep.show_id) {
@@ -298,7 +360,6 @@ async function lookupTmdb(imdbId, isSeries) {
       return { title: 'Unknown', year: 'N/A', imdbId };
     }
 
-    // Movie
     if (data.movie_results && data.movie_results[0]) {
       const item = data.movie_results[0];
       return {
@@ -383,7 +444,6 @@ async function handleStream(type, id) {
   const allDebug = { type, id, imdbId, season, episode, meta, sources: [] };
 
   if (meta.title === 'Unknown') {
-    // Fallback: subukan pa rin ang EZTV (imdb-based, walang title)
     if (isSeries && season && episode) {
       const eztvResult = await fetchEztv(imdbId, season, episode);
       allDebug.sources.push(eztvResult.debug);
@@ -396,10 +456,13 @@ async function handleStream(type, id) {
 
   const promises = [];
   if (!isSeries) {
+    // 🎬 MOVIES — YTS lang (hindi ginalaw)
     promises.push(fetchYTS(imdbId));
   } else if (season && episode) {
+    // 📺 SERIES — EZTV + 1337x + ThePirateBay
     promises.push(fetchEztv(imdbId, season, episode));
     promises.push(fetch1337x(meta.title, season, episode));
+    promises.push(fetchTPB(meta.title, season, episode));
   } else {
     return { streams: [], _debug: { ...allDebug, error: 'missing season/episode' } };
   }
@@ -433,7 +496,6 @@ export default {
       return new Response(JSON.stringify(MANIFEST), { headers: CORS });
     }
 
-    // DEBUG endpoint
     const debugMatch = path.match(/^\/debug\/([^/]+)\/(.+)\.json$/);
     if (debugMatch) {
       const type = debugMatch[1];
