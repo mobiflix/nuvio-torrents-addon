@@ -1,5 +1,5 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v1.4.0)
+// NUVIO TORRENTS — Cloudflare Worker Addon (v1.4.1)
 // Movies:  YTS
 // Series:  EZTV + 1337x (apibay) + ThePirateBay (apibay) + Knaben
 // ============================================================
@@ -38,7 +38,7 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '1.4.0',
+  version: '1.4.1',
   name: 'MobiFlix',
   description: '1080p torrent magnet links — YTS + EZTV + 1337x + ThePirateBay + Knaben.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
@@ -227,7 +227,7 @@ async function fetch1337x(title, season, episode) {
       if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
       const nameNorm = normalizeTitle(t.name);
       const matched = tWords.filter(w => nameNorm.includes(w));
-      if (matched.length < Math.max(1, Math.floor(tWords.length * 0.4))) { reasonCount.titleMismatch++; continue; }
+      if (matched.length < 1) { reasonCount.titleMismatch++; continue; }
       out.push({
         source: '1337x',
         hash: t.info_hash,
@@ -293,7 +293,7 @@ async function fetchTPB(title, season, episode) {
       if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
       const nameNorm = normalizeTitle(t.name);
       const matched = tWords.filter(w => nameNorm.includes(w));
-      if (matched.length < Math.max(1, Math.floor(tWords.length * 0.4))) { reasonCount.titleMismatch++; continue; }
+      if (matched.length < 1) { reasonCount.titleMismatch++; continue; }
       out.push({
         source: 'ThePirateBay',
         hash: t.info_hash,
@@ -314,10 +314,8 @@ async function fetchTPB(title, season, episode) {
 }
 
 // ============ SOURCE: Knaben (aggregator, hindi apibay) ============
-// Knaben ay nag-a-aggregate ng 1337x, TPB, RARBG, YTS, EZTV, TorrentGalaxy at iba pa
-// Public API, walang key, JSON search
 async function fetchKnaben(title, season, episode) {
-  const debug = { source: 'Knaben', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0 };
+  const debug = { source: 'Knaben', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0, sample: [] };
   try {
     const s = String(season).padStart(2, '0');
     const e = String(episode).padStart(2, '0');
@@ -376,6 +374,14 @@ async function fetchKnaben(title, season, episode) {
     }
     debug.totalFetched = all.length;
 
+    // Sample para makita natin ang structure
+    debug.sample = all.slice(0, 5).map(t => ({
+      name: (t.name || '').substring(0, 90),
+      seeds: t.seeders,
+      is1080p: is1080p(t.name || ''),
+      matchesSE: matchesSe(t.name || '', season, episode)
+    }));
+
     const out = [];
     const tWords = titleWords(title);
     const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0, titleMismatch: 0 };
@@ -386,7 +392,7 @@ async function fetchKnaben(title, season, episode) {
       if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
       const nameNorm = normalizeTitle(t.name);
       const matched = tWords.filter(w => nameNorm.includes(w));
-      if (matched.length < Math.max(1, Math.floor(tWords.length * 0.4))) { reasonCount.titleMismatch++; continue; }
+      if (matched.length < 1) { reasonCount.titleMismatch++; continue; }
       out.push({
         source: 'Knaben',
         hash: t.info_hash,
@@ -444,7 +450,6 @@ async function lookupTmdb(imdbId, isSeries) {
 
 // ============ BUILD STREAMS ============
 function buildStreams(items, title, year, isSeries, season, episode) {
-  // Dedup by hash — pwedeng may duplicates sa Knaben + 1337x + TPB
   const seen = new Set();
   const unique = [];
   for (const item of items) {
@@ -514,27 +519,19 @@ async function handleStream(type, id) {
 
   if (meta.title === 'Unknown') {
     if (isSeries && season && episode) {
-      // Fallback: EZTV (imdb-based) + Knaben (title-based pa rin pero walang TMDB required kung may title na)
-      const [eztvR, knabenR] = await Promise.allSettled([
-        fetchEztv(imdbId, season, episode),
-        // Wala tayong title kaya skip muna Knaben kung Unknown
-      ]);
-      if (eztvR.status === 'fulfilled') {
-        allDebug.sources.push(eztvR.value.debug);
-        allDebug.tmdbFailed = true;
-        const fallbackStreams = buildStreams(eztvR.value.items, 'Unknown', 'N/A', isSeries, season, episode);
-        return { streams: fallbackStreams, _debug: allDebug };
-      }
+      const eztvResult = await fetchEztv(imdbId, season, episode);
+      allDebug.sources.push(eztvResult.debug);
+      allDebug.tmdbFailed = true;
+      const fallbackStreams = buildStreams(eztvResult.items, 'Unknown', 'N/A', isSeries, season, episode);
+      return { streams: fallbackStreams, _debug: allDebug };
     }
     return { streams: [], _debug: { ...allDebug, error: 'tmdb unknown title' } };
   }
 
   const promises = [];
   if (!isSeries) {
-    // 🎬 MOVIES — YTS lang
     promises.push(fetchYTS(imdbId));
   } else if (season && episode) {
-    // 📺 SERIES — lahat ng sources (may dedup sa buildStreams)
     promises.push(fetchEztv(imdbId, season, episode));
     promises.push(fetch1337x(meta.title, season, episode));
     promises.push(fetchTPB(meta.title, season, episode));
