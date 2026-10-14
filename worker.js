@@ -38,7 +38,7 @@ const CORS = {
 const MANIFEST = {
   id: 'community.nuvio.torrents',
   version: '1.0.0',
-  name: 'Nuvio Torrents',
+  name: 'MobiFlix',
   description: '1080p torrent magnet links — YTS + EZTV + 1337x. Movies at series. Minimum 15 seeders.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
   author: 'Nuvio Team',
