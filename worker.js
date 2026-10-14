@@ -1,5 +1,5 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v1.1.0)
+// NUVIO TORRENTS — Cloudflare Worker Addon (v1.2.0)
 // Sources: YTS + EZTV + 1337x (via apibay)
 // Quality: 1080p only
 // ============================================================
@@ -7,7 +7,7 @@
 const TMDB_API_KEY = '1865f43a0549ca50d341dd9ab8b29f49';
 const YTS_API_BASE = 'https://movies-api.accel.li/api/v2';
 const MIN_SEEDS_MOVIE = 15;
-const MIN_SEEDS_SERIES = 5;   // mas mababa para sa series
+const MIN_SEEDS_SERIES = 3;
 const QUALITY_LABEL = '1080p';
 
 const HEADERS = {
@@ -38,7 +38,7 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '1.1.0',
+  version: '1.2.0',
   name: 'MobiFlix',
   description: '1080p torrent magnet links — YTS + EZTV + 1337x.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
@@ -142,9 +142,8 @@ async function fetchYTS(imdbId) {
 
 // ============ SOURCE: EZTV ============
 async function fetchEztv(imdbId, season, episode) {
-  const debug = { source: 'EZTV', url: '', count: 0, error: null };
+  const debug = { source: 'EZTV', url: '', count: 0, error: null, totalFetched: 0, sample: [] };
   try {
-    // EZTV requires NUMERIC imdb_id (no "tt")
     const numericId = String(imdbId).replace(/^tt/, '');
     const url = 'https://eztvx.to/api/get-torrents?imdb_id=' + numericId + '&limit=100';
     debug.url = url;
@@ -155,13 +154,28 @@ async function fetchEztv(imdbId, season, episode) {
     }
     debug.totalFetched = data.torrents.length;
 
+    // Sample para makita natin ang structure
+    debug.sample = data.torrents.slice(0, 3).map(t => ({
+      filename: t.filename,
+      season: t.season,
+      episode: t.episode,
+      seeds: t.seeds,
+      is1080p: is1080p(t.filename || '')
+    }));
+
     const out = [];
+    let reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0 };
     for (const t of data.torrents) {
       if (!t?.hash || !t?.filename) continue;
-      if (String(t.season) !== String(season) || String(t.episode) !== String(episode)) continue;
-      if (!is1080p(t.filename)) continue;
+
+      const tSeason = parseInt(t.season) || 0;
+      const tEpisode = parseInt(t.episode) || 0;
+      if (tSeason !== season || tEpisode !== episode) { reasonCount.seMismatch++; continue; }
+      if (!is1080p(t.filename)) { reasonCount.not1080p++; continue; }
+
       const seeds = parseInt(t.seeds) || 0;
-      if (seeds < MIN_SEEDS_SERIES) continue;
+      if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
+
       out.push({
         source: 'EZTV',
         hash: t.hash,
@@ -172,6 +186,7 @@ async function fetchEztv(imdbId, season, episode) {
         magnet: t.magnet_url || buildMagnet(t.hash, t.filename)
       });
     }
+    debug.reasonCount = reasonCount;
     debug.count = out.length;
     return { items: out, debug };
   } catch (e) {
@@ -182,12 +197,15 @@ async function fetchEztv(imdbId, season, episode) {
 
 // ============ SOURCE: 1337x (via apibay) ============
 async function fetch1337x(title, season, episode) {
-  const debug = { source: '1337x', urls: [], count: 0, error: null };
+  const debug = { source: '1337x', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0 };
   try {
+    const s = String(season).padStart(2, '0');
+    const e = String(episode).padStart(2, '0');
     const queries = [
-      title + ' S' + String(season).padStart(2, '0') + 'E' + String(episode).padStart(2, '0') + ' 1080p',
-      title + ' S' + String(season).padStart(2, '0') + 'E' + String(episode).padStart(2, '0') + ' x265',
-      title + ' ' + season + 'x' + String(episode).padStart(2, '0') + ' 1080p'
+      title + ' S' + s + 'E' + e + ' 1080p',
+      title + ' S' + s + 'E' + e,
+      title + ' ' + season + 'x' + e + ' 1080p',
+      title + ' 1080p'
     ];
     const seen = new Set();
     const all = [];
@@ -196,6 +214,8 @@ async function fetch1337x(title, season, episode) {
         const url = 'https://apibay.org/q.php?q=' + encodeURIComponent(q) + '&cat=0';
         debug.urls.push(url);
         const arr = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
+        const count = Array.isArray(arr) ? arr.length : 0;
+        debug.rawCounts.push({ q, count });
         if (Array.isArray(arr)) {
           for (const t of arr) {
             if (t && t.info_hash && !seen.has(t.info_hash) && t.info_hash !== '0000000000000000000000000000000000000000') {
@@ -204,20 +224,23 @@ async function fetch1337x(title, season, episode) {
             }
           }
         }
-      } catch (_) {}
+      } catch (err) {
+        debug.rawCounts.push({ q, error: err.message });
+      }
     }
     debug.totalFetched = all.length;
 
     const out = [];
     const tWords = titleWords(title);
+    let reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0, titleMismatch: 0 };
     for (const t of all) {
-      if (!matchesSe(t.name, season, episode)) continue;
-      if (!is1080p(t.name)) continue;
+      if (!matchesSe(t.name, season, episode)) { reasonCount.seMismatch++; continue; }
+      if (!is1080p(t.name)) { reasonCount.not1080p++; continue; }
       const seeds = parseInt(t.seeders) || 0;
-      if (seeds < MIN_SEEDS_SERIES) continue;
+      if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
       const nameNorm = normalizeTitle(t.name);
       const matched = tWords.filter(w => nameNorm.includes(w));
-      if (matched.length < Math.max(1, Math.floor(tWords.length * 0.5))) continue;
+      if (matched.length < Math.max(1, Math.floor(tWords.length * 0.4))) { reasonCount.titleMismatch++; continue; }
 
       out.push({
         source: '1337x',
@@ -229,6 +252,7 @@ async function fetch1337x(title, season, episode) {
         magnet: buildMagnet(t.info_hash, t.name)
       });
     }
+    debug.reasonCount = reasonCount;
     debug.count = out.length;
     return { items: out, debug };
   } catch (e) {
@@ -237,22 +261,53 @@ async function fetch1337x(title, season, episode) {
   }
 }
 
-// ============ TMDB LOOKUP ============
+// ============ TMDB LOOKUP (may episode-ID fallback) ============
 async function lookupTmdb(imdbId, isSeries) {
   try {
     const url = 'https://api.themoviedb.org/3/find/' + imdbId +
       '?api_key=' + TMDB_API_KEY + '&external_source=imdb_id';
     const data = await fetch(url).then(r => r.json()).catch(() => null);
     if (!data) return { title: 'Unknown', year: 'N/A', imdbId };
-    const item = isSeries
-      ? (data.tv_results && data.tv_results[0])
-      : (data.movie_results && data.movie_results[0]);
-    if (!item) return { title: 'Unknown', year: 'N/A', imdbId };
-    return {
-      title: item.title || item.name || 'Unknown',
-      year: (item.release_date || item.first_air_date || 'N/A').split('-')[0],
-      imdbId
-    };
+
+    if (isSeries) {
+      // Normal case: series ID
+      if (data.tv_results && data.tv_results[0]) {
+        const item = data.tv_results[0];
+        return {
+          title: item.name || 'Unknown',
+          year: (item.first_air_date || 'N/A').split('-')[0],
+          imdbId
+        };
+      }
+      // Fallback: episode ID → kunin ang show
+      if (data.tv_episode_results && data.tv_episode_results[0]) {
+        const ep = data.tv_episode_results[0];
+        if (ep.show_id) {
+          const showUrl = 'https://api.themoviedb.org/3/tv/' + ep.show_id + '?api_key=' + TMDB_API_KEY;
+          const show = await fetch(showUrl).then(r => r.json()).catch(() => null);
+          if (show && show.name) {
+            return {
+              title: show.name,
+              year: (show.first_air_date || 'N/A').split('-')[0],
+              imdbId,
+              note: 'resolved from episode ID'
+            };
+          }
+        }
+      }
+      return { title: 'Unknown', year: 'N/A', imdbId };
+    }
+
+    // Movie
+    if (data.movie_results && data.movie_results[0]) {
+      const item = data.movie_results[0];
+      return {
+        title: item.title || 'Unknown',
+        year: (item.release_date || 'N/A').split('-')[0],
+        imdbId
+      };
+    }
+    return { title: 'Unknown', year: 'N/A', imdbId };
   } catch (e) {
     return { title: 'Unknown', year: 'N/A', imdbId };
   }
@@ -328,6 +383,14 @@ async function handleStream(type, id) {
   const allDebug = { type, id, imdbId, season, episode, meta, sources: [] };
 
   if (meta.title === 'Unknown') {
+    // Fallback: subukan pa rin ang EZTV (imdb-based, walang title)
+    if (isSeries && season && episode) {
+      const eztvResult = await fetchEztv(imdbId, season, episode);
+      allDebug.sources.push(eztvResult.debug);
+      allDebug.tmdbFailed = true;
+      const fallbackStreams = buildStreams(eztvResult.items, 'Unknown', 'N/A', isSeries, season, episode);
+      return { streams: fallbackStreams, _debug: allDebug };
+    }
     return { streams: [], _debug: { ...allDebug, error: 'tmdb unknown title' } };
   }
 
@@ -370,7 +433,7 @@ export default {
       return new Response(JSON.stringify(MANIFEST), { headers: CORS });
     }
 
-    // 🔥 DEBUG endpoint — buksan ito sa browser para makita kung saan nawawala
+    // DEBUG endpoint
     const debugMatch = path.match(/^\/debug\/([^/]+)\/(.+)\.json$/);
     if (debugMatch) {
       const type = debugMatch[1];
@@ -389,7 +452,6 @@ export default {
       const id = decodeURIComponent(streamMatch[2]);
       try {
         const result = await handleStream(type, id);
-        // huwag isama ang _debug sa normal response
         return new Response(JSON.stringify({ streams: result.streams }), { headers: CORS });
       } catch (e) {
         return new Response(JSON.stringify({ streams: [], error: e.message }), { headers: CORS });
