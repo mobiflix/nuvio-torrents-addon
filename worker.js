@@ -1,18 +1,19 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v1.6.0)
-// Movies:  YTS
-// Series:  EZTV + 1337x + ThePirateBay + TorrentGalaxy
+// NUVIO TORRENTS — Cloudflare Worker Addon (v2.0.0)
+// Movies:  YTS (1080p, min 15 seeds)
+// Series:  Torrentio (aggregated, 1080p, min 3 seeds)
 // ============================================================
 
 const TMDB_API_KEY = '1865f43a0549ca50d341dd9ab8b29f49';
 const YTS_API_BASE = 'https://movies-api.accel.li/api/v2';
+const TORRENTIO_API = 'https://torrentio.strem.fun';
 const MIN_SEEDS_MOVIE = 15;
 const MIN_SEEDS_SERIES = 3;
 const QUALITY_LABEL = '1080p';
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-  'Accept': 'text/html,application/json,*/*'
+  'Accept': 'application/json'
 };
 
 const TRACKERS = [
@@ -35,11 +36,12 @@ const CORS = {
   'Content-Type': 'application/json'
 };
 
+// ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '1.6.0',
+  version: '2.0.0',
   name: 'MobiFlix',
-  description: '1080p torrent magnet links — YTS + EZTV + 1337x + ThePirateBay + TorrentGalaxy.',
+  description: '1080p torrent magnet links — YTS (movies) + Torrentio (series).',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
   author: 'Nuvio Team',
   types: ['movie', 'series'],
@@ -61,44 +63,20 @@ function buildMagnet(hash, name) {
   return 'magnet:?xt=urn:btih:' + hash + dn + trackers;
 }
 
-function normalizeTitle(title) {
-  if (!title) return '';
-  return String(title).replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-function titleWords(title) {
-  return normalizeTitle(title).split(/\s+/).filter(w => w.length > 2);
-}
-
-function buildSePatterns(season, episode) {
-  const s = String(season), e = String(episode);
-  const sPad = s.padStart(2, '0'), ePad = e.padStart(2, '0');
-  return [
-    new RegExp('S' + sPad + '[\\s._-]?E' + ePad, 'i'),
-    new RegExp('\\b' + s + 'x' + ePad + '\\b', 'i'),
-    new RegExp('Season[\\s._-]?' + s + '[\\s._-]?Episode[\\s._-]?' + e, 'i'),
-    new RegExp('S' + sPad + '[\\s._-]?' + ePad, 'i'),
-    new RegExp('\\b' + sPad + ePad + '\\b', 'i')
-  ];
-}
-
-function matchesSe(name, season, episode) {
-  return buildSePatterns(season, episode).some(p => p.test(name));
-}
-
 function is1080p(filename) {
   return /\b1080p\b|\bFHD\b/i.test(filename);
 }
 
-function parseSizeBytes(sizeStr, torrent) {
-  if (typeof torrent?.size === 'number' && torrent.size > 0) return Math.floor(torrent.size);
-  if (typeof torrent?.bytes === 'number' && torrent.bytes > 0) return Math.floor(torrent.bytes);
-  const m = String(sizeStr).match(/([0-9.]+)\s*([GM]B)/i);
+function parseSizeBytes(sizeStr) {
+  if (!sizeStr) return 0;
+  const m = String(sizeStr).match(/([0-9.]+)\s*([GMK]B?)/i);
   if (!m) return 0;
   const val = parseFloat(m[1]);
-  const unit = m[2].toUpperCase();
-  if (unit === 'GB') return Math.floor(val * 1073741824);
-  if (unit === 'MB') return Math.floor(val * 1048576);
+  const unit = (m[2] || 'GB').toUpperCase();
+  if (unit.startsWith('T')) return Math.floor(val * 1099511627776);
+  if (unit.startsWith('G')) return Math.floor(val * 1073741824);
+  if (unit.startsWith('M')) return Math.floor(val * 1048576);
+  if (unit.startsWith('K')) return Math.floor(val * 1024);
   return 0;
 }
 
@@ -120,10 +98,12 @@ async function fetchYTS(imdbId) {
         const seeds = parseInt(t.seeds) || 0;
         if (seeds < MIN_SEEDS_MOVIE) continue;
         out.push({
-          source: 'YTS', hash: t.hash,
+          source: 'YTS',
+          hash: t.hash,
           filename: movie.title + ' ' + t.quality,
-          seeds, peers: parseInt(t.peers) || 0,
-          sizeBytes: parseSizeBytes(t.size, t),
+          seeds,
+          peers: parseInt(t.peers) || 0,
+          sizeBytes: parseSizeBytes(t.size),
           magnet: buildMagnet(t.hash, movie.title)
         });
       }
@@ -136,292 +116,84 @@ async function fetchYTS(imdbId) {
   }
 }
 
-// ============ SOURCE: EZTV ============
-async function fetchEztv(imdbId, season, episode) {
-  const debug = { source: 'EZTV', url: '', count: 0, error: null, totalFetched: 0 };
+// ============ SOURCE: Torrentio (SERIES ONLY) ============
+async function fetchTorrentio(type, imdbId, season, episode) {
+  const debug = { source: 'Torrentio', url: '', count: 0, error: null, totalFetched: 0, reasonCount: {} };
   try {
-    const numericId = String(imdbId).replace(/^tt/, '');
-    const url = 'https://eztvx.to/api/get-torrents?imdb_id=' + numericId + '&limit=100';
+    const id = season && episode ? `${imdbId}:${season}:${episode}` : imdbId;
+    const url = TORRENTIO_API + '/stream/' + type + '/' + id + '.json';
     debug.url = url;
+
     const data = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
-    if (!data?.torrents || !Array.isArray(data.torrents)) {
-      debug.error = 'no torrents array';
+    if (!data?.streams || !Array.isArray(data.streams)) {
+      debug.error = 'no streams array';
       return { items: [], debug };
     }
-    debug.totalFetched = data.torrents.length;
+    debug.totalFetched = data.streams.length;
+
     const out = [];
-    const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0 };
-    for (const t of data.torrents) {
-      if (!t?.hash || !t?.filename) continue;
-      const tSeason = parseInt(t.season) || 0;
-      const tEpisode = parseInt(t.episode) || 0;
-      if (tSeason !== season || tEpisode !== episode) { reasonCount.seMismatch++; continue; }
-      if (!is1080p(t.filename)) { reasonCount.not1080p++; continue; }
-      const seeds = parseInt(t.seeds) || 0;
-      if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
-      out.push({
-        source: 'EZTV', hash: t.hash, filename: t.filename,
-        seeds, peers: parseInt(t.peers) || 0,
-        sizeBytes: parseInt(t.size_bytes) || 0,
-        magnet: t.magnet_url || buildMagnet(t.hash, t.filename)
-      });
-    }
-    debug.reasonCount = reasonCount;
-    debug.count = out.length;
-    return { items: out, debug };
-  } catch (e) {
-    debug.error = e?.message || String(e);
-    return { items: [], debug };
-  }
-}
+    const reasonCount = { noFilename: 0, not1080p: 0, lowSeeds: 0, noHash: 0 };
 
-// ============ SOURCE: 1337x (via apibay) ============
-async function fetch1337x(title, season, episode) {
-  const debug = { source: '1337x', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0 };
-  try {
-    const s = String(season).padStart(2, '0');
-    const e = String(episode).padStart(2, '0');
-    const queries = [
-      title + ' S' + s + 'E' + e + ' 1080p',
-      title + ' S' + s + 'E' + e,
-      title + ' ' + season + 'x' + e + ' 1080p',
-      title + ' 1080p'
-    ];
-    const seen = new Set();
-    const all = [];
-    for (const q of queries) {
-      try {
-        const url = 'https://apibay.org/q.php?q=' + encodeURIComponent(q) + '&cat=0';
-        debug.urls.push(url);
-        const arr = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
-        const count = Array.isArray(arr) ? arr.length : 0;
-        debug.rawCounts.push({ q, count });
-        if (Array.isArray(arr)) {
-          for (const t of arr) {
-            if (t && t.info_hash && !seen.has(t.info_hash) && t.info_hash !== '0000000000000000000000000000000000000000') {
-              seen.add(t.info_hash); all.push(t);
-            }
-          }
-        }
-      } catch (err) { debug.rawCounts.push({ q, error: err.message }); }
-    }
-    debug.totalFetched = all.length;
-    const out = [];
-    const tWords = titleWords(title);
-    const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0, titleMismatch: 0 };
-    for (const t of all) {
-      if (!matchesSe(t.name, season, episode)) { reasonCount.seMismatch++; continue; }
-      if (!is1080p(t.name)) { reasonCount.not1080p++; continue; }
-      const seeds = parseInt(t.seeders) || 0;
-      if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
-      const nameNorm = normalizeTitle(t.name);
-      const matched = tWords.filter(w => nameNorm.includes(w));
-      if (matched.length < 1) { reasonCount.titleMismatch++; continue; }
-      out.push({
-        source: '1337x', hash: t.info_hash, filename: t.name,
-        seeds, peers: parseInt(t.leechers) || 0,
-        sizeBytes: parseInt(t.size) || 0,
-        magnet: buildMagnet(t.info_hash, t.name)
-      });
-    }
-    debug.reasonCount = reasonCount;
-    debug.count = out.length;
-    return { items: out, debug };
-  } catch (e) {
-    debug.error = e?.message || String(e);
-    return { items: [], debug };
-  }
-}
+    for (const s of data.streams) {
+      // Torrentio returns: name, title, infoHash, fileIdx, behaviorHints.bingeGroup, sources
+      const infoHash = s.infoHash || (s.url && s.url.match(/btih:([a-f0-9]{40})/i)?.[1]);
+      if (!infoHash) { reasonCount.noHash++; continue; }
 
-// ============ SOURCE: ThePirateBay (via apibay) ============
-async function fetchTPB(title, season, episode) {
-  const debug = { source: 'ThePirateBay', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0 };
-  try {
-    const s = String(season).padStart(2, '0');
-    const e = String(episode).padStart(2, '0');
-    const queries = [
-      title + ' S' + s + 'E' + e + ' 1080p',
-      title + ' S' + s + 'E' + e,
-      title + ' S' + s + ' 1080p',
-      title + ' ' + s + 'x' + e + ' 1080p',
-      title + ' ' + season + 'x' + e
-    ];
-    const seen = new Set();
-    const all = [];
-    for (const q of queries) {
-      try {
-        const url = 'https://apibay.org/q.php?q=' + encodeURIComponent(q) + '&cat=0';
-        debug.urls.push(url);
-        const arr = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
-        const count = Array.isArray(arr) ? arr.length : 0;
-        debug.rawCounts.push({ q, count });
-        if (Array.isArray(arr)) {
-          for (const t of arr) {
-            if (t && t.info_hash && !seen.has(t.info_hash) && t.info_hash !== '0000000000000000000000000000000000000000') {
-              seen.add(t.info_hash); all.push(t);
-            }
-          }
-        }
-      } catch (err) { debug.rawCounts.push({ q, error: err.message }); }
-    }
-    debug.totalFetched = all.length;
-    const out = [];
-    const tWords = titleWords(title);
-    const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0, titleMismatch: 0 };
-    for (const t of all) {
-      if (!matchesSe(t.name, season, episode)) { reasonCount.seMismatch++; continue; }
-      if (!is1080p(t.name)) { reasonCount.not1080p++; continue; }
-      const seeds = parseInt(t.seeders) || 0;
-      if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
-      const nameNorm = normalizeTitle(t.name);
-      const matched = tWords.filter(w => nameNorm.includes(w));
-      if (matched.length < 1) { reasonCount.titleMismatch++; continue; }
-      out.push({
-        source: 'ThePirateBay', hash: t.info_hash, filename: t.name,
-        seeds, peers: parseInt(t.leechers) || 0,
-        sizeBytes: parseInt(t.size) || 0,
-        magnet: buildMagnet(t.info_hash, t.name)
-      });
-    }
-    debug.reasonCount = reasonCount;
-    debug.count = out.length;
-    return { items: out, debug };
-  } catch (e) {
-    debug.error = e?.message || String(e);
-    return { items: [], debug };
-  }
-}
+      // Extract filename/title from Torrentio's "title" field
+      const filename = s.title || s.name || '';
+      if (!filename) { reasonCount.noFilename++; continue; }
 
-// ============ SOURCE: TorrentGalaxy (direct fetch, walang proxy) ============
-async function fetchTorrentGalaxy(title, season, episode) {
-  const debug = { source: 'TorrentGalaxy', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0, sample: [] };
-  try {
-    const s = String(season).padStart(2, '0');
-    const e = String(episode).padStart(2, '0');
-    const queries = [
-      title + ' S' + s + 'E' + e + ' 1080p',
-      title + ' S' + s + 'E' + e,
-      title + ' ' + s + 'x' + e + ' 1080p'
-    ];
+      // Check 1080p
+      if (!is1080p(filename)) { reasonCount.not1080p++; continue; }
 
-    const seen = new Set();
-    const all = [];
-
-    for (const q of queries) {
-      try {
-        // TorrentGalaxy search API endpoint (JSON, minsan HTML kung API fails)
-        const url = 'https://torrentgalaxy.to/torrents.php?search=' + encodeURIComponent(q) +
-                    '&sort=seeders&order=desc&nox=2&nox=1';
-        debug.urls.push(url);
-        const res = await fetch(url, { headers: HEADERS }).then(r => r.text()).catch(() => null);
-        if (!res) { debug.rawCounts.push({ q, error: 'no response' }); continue; }
-
-        // Parse HTML para sa torrent entries
-        // Look for pattern: <a href="/torrent/HASH/...">NAME</a>
-        const regex = /<a href="\/torrent\/([a-f0-9]{40})\/([^"]+)"[^>]*>([^<]+)<\/a>/gi;
-        let match;
-        const found = [];
-        while ((match = regex.exec(res)) !== null) {
-          const hash = match[1].toLowerCase();
-          const name = (match[3] || '').trim();
-          if (!hash || hash.length !== 40 || seen.has(hash)) continue;
-          if (!name) continue;
-          seen.add(hash);
-          found.push({ name, hash });
-        }
-
-        // Hanapin din ang seeders count malapit sa bawat entry
-        // Mas simple: mag-extract ng seeders via second regex
-        const seedRegex = /<td[^>]*class="[^"]*seeders[^"]*"[^>]*>(\d+)<\/td>/gi;
-        const seedersArr = [];
-        let sMatch;
-        while ((sMatch = seedRegex.exec(res)) !== null) {
-          seedersArr.push(parseInt(sMatch[1]) || 0);
-        }
-
-        // Pagsamahin
-        for (let i = 0; i < found.length; i++) {
-          all.push({
-            name: found[i].name,
-            info_hash: found[i].hash,
-            seeders: String(seedersArr[i] || 0),
-            leechers: '0',
-            size: '0'
-          });
-        }
-
-        debug.rawCounts.push({ q, count: found.length });
-      } catch (err) {
-        debug.rawCounts.push({ q, error: err.message });
+      // Extract seeders — Torrentio uses "seeders" field kung minsan, o nasa title
+      let seeds = parseInt(s.seeders) || 0;
+      if (!seeds) {
+        // Try to extract from title (hal. "👤 123")
+        const seedMatch = filename.match(/👤\s*(\d+)/);
+        if (seedMatch) seeds = parseInt(seedMatch[1]) || 0;
       }
-    }
-    debug.totalFetched = all.length;
-
-    debug.sample = all.slice(0, 5).map(t => ({
-      name: (t.name || '').substring(0, 90),
-      seeds: t.seeders,
-      is1080p: is1080p(t.name || ''),
-      matchesSE: matchesSe(t.name || '', season, episode)
-    }));
-
-    const out = [];
-    const tWords = titleWords(title);
-    const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0, titleMismatch: 0 };
-    for (const t of all) {
-      if (!matchesSe(t.name, season, episode)) { reasonCount.seMismatch++; continue; }
-      if (!is1080p(t.name)) { reasonCount.not1080p++; continue; }
-      const seeds = parseInt(t.seeders) || 0;
       if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
-      const nameNorm = normalizeTitle(t.name);
-      const matched = tWords.filter(w => nameNorm.includes(w));
-      if (matched.length < 1) { reasonCount.titleMismatch++; continue; }
+
+      // Extract size — Torrentio sometimes has "size" field, o nasa title (💾 1.23 GB)
+      let sizeBytes = 0;
+      if (s.size) sizeBytes = parseInt(s.size) || 0;
+      if (!sizeBytes) {
+        const sizeMatch = filename.match(/💾\s*([0-9.]+\s*[GMKT]B?)/i);
+        if (sizeMatch) sizeBytes = parseSizeBytes(sizeMatch[1]);
+      }
+
+      // Build magnet — gamitin ang Torrentio sources kung meron
+      let magnet;
+      if (s.infoHash) {
+        magnet = buildMagnet(s.infoHash, filename.replace(/^.*?\n/, '').trim());
+      } else if (s.url && s.url.startsWith('magnet:')) {
+        magnet = s.url;
+      } else {
+        magnet = buildMagnet(infoHash, filename);
+      }
+
+      // Extract clean filename from title (Torrentio includes emoji decorations)
+      const cleanName = filename.replace(/[^\w\s.\-\[\]()]/g, ' ').replace(/\s+/g, ' ').trim();
+
       out.push({
-        source: 'TorrentGalaxy', hash: t.info_hash, filename: t.name,
-        seeds, peers: parseInt(t.leechers) || 0,
-        sizeBytes: parseInt(t.size) || 0,
-        magnet: buildMagnet(t.info_hash, t.name)
+        source: 'Torrentio',
+        hash: infoHash.toLowerCase(),
+        filename: cleanName || filename,
+        seeds,
+        peers: 0,
+        sizeBytes,
+        magnet,
+        bingeGroup: s.behaviorHints?.bingeGroup || null
       });
     }
+
     debug.reasonCount = reasonCount;
     debug.count = out.length;
     return { items: out, debug };
   } catch (e) {
     debug.error = e?.message || String(e);
     return { items: [], debug };
-  }
-}
-
-// ============ TMDB LOOKUP ============
-async function lookupTmdb(imdbId, isSeries) {
-  try {
-    const url = 'https://api.themoviedb.org/3/find/' + imdbId +
-      '?api_key=' + TMDB_API_KEY + '&external_source=imdb_id';
-    const data = await fetch(url).then(r => r.json()).catch(() => null);
-    if (!data) return { title: 'Unknown', year: 'N/A', imdbId };
-    if (isSeries) {
-      if (data.tv_results && data.tv_results[0]) {
-        const item = data.tv_results[0];
-        return { title: item.name || 'Unknown', year: (item.first_air_date || 'N/A').split('-')[0], imdbId };
-      }
-      if (data.tv_episode_results && data.tv_episode_results[0]) {
-        const ep = data.tv_episode_results[0];
-        if (ep.show_id) {
-          const showUrl = 'https://api.themoviedb.org/3/tv/' + ep.show_id + '?api_key=' + TMDB_API_KEY;
-          const show = await fetch(showUrl).then(r => r.json()).catch(() => null);
-          if (show && show.name) {
-            return { title: show.name, year: (show.first_air_date || 'N/A').split('-')[0], imdbId, note: 'resolved from episode ID' };
-          }
-        }
-      }
-      return { title: 'Unknown', year: 'N/A', imdbId };
-    }
-    if (data.movie_results && data.movie_results[0]) {
-      const item = data.movie_results[0];
-      return { title: item.title || 'Unknown', year: (item.release_date || 'N/A').split('-')[0], imdbId };
-    }
-    return { title: 'Unknown', year: 'N/A', imdbId };
-  } catch (e) {
-    return { title: 'Unknown', year: 'N/A', imdbId };
   }
 }
 
@@ -435,7 +207,9 @@ function buildStreams(items, title, year, isSeries, season, episode) {
     unique.push(item);
   }
   if (!unique.length) return [];
+
   unique.sort((a, b) => b.seeds - a.seeds || a.sizeBytes - b.sizeBytes);
+
   return unique.map(item => {
     const sizeGB = (item.sizeBytes / 1073741824).toFixed(2);
     const extras = [];
@@ -446,16 +220,25 @@ function buildStreams(items, title, year, isSeries, season, episode) {
     if (/\bATMOS\b/i.test(item.filename)) extras.push('ATMOS');
     if (/\bDTS\b/i.test(item.filename)) extras.push('DTS');
     if (/\b5\.1\b/i.test(item.filename)) extras.push('5.1');
+
     const titleLine = isSeries
       ? '🎬 ' + title + ' S' + String(season).padStart(2, '0') + ' E' + String(episode).padStart(2, '0')
       : '🎬 ' + title + ' (' + year + ')';
     const qualityLine = '🔥 ' + QUALITY_LABEL + (extras.length ? ' | ' + extras.join(' | ') : '');
     const statsLine = '🌱 ' + item.seeds + ' | 💾 ' + sizeGB + ' GB | 🔗 ' + item.source;
     const description = titleLine + '\n' + qualityLine + '\n' + statsLine;
+
+    // Source label — mas maikli para sa Torrentio
+    const sourceLabel = item.source === 'Torrentio' ? 'Torrentio' : item.source;
+
     return {
-      name: item.source + ' | ' + QUALITY_LABEL.toUpperCase() + ' | 🌱 ' + item.seeds,
-      title: description, description: description, url: item.magnet,
-      behaviorHints: { bingeGroup: 'nuvio-torrents-' + item.source + '-1080p' }
+      name: sourceLabel + ' | ' + QUALITY_LABEL.toUpperCase() + ' | 🌱 ' + item.seeds,
+      title: description,
+      description: description,
+      url: item.magnet,
+      behaviorHints: {
+        bingeGroup: item.bingeGroup || ('nuvio-torrents-' + item.source + '-1080p')
+      }
     };
   });
 }
@@ -478,43 +261,29 @@ function parseId(id) {
 async function handleStream(type, id) {
   const isSeries = type === 'series' || type === 'tv';
   const { imdbId, season, episode } = parseId(id);
+
   if (!imdbId || !/^tt\d+$/.test(imdbId)) {
     return { streams: [], _debug: { error: 'invalid imdb', id } };
   }
-  const meta = await lookupTmdb(imdbId, isSeries);
-  const allDebug = { type, id, imdbId, season, episode, meta, sources: [] };
-  if (meta.title === 'Unknown') {
-    if (isSeries && season && episode) {
-      const eztvResult = await fetchEztv(imdbId, season, episode);
-      allDebug.sources.push(eztvResult.debug);
-      allDebug.tmdbFailed = true;
-      const fallbackStreams = buildStreams(eztvResult.items, 'Unknown', 'N/A', isSeries, season, episode);
-      return { streams: fallbackStreams, _debug: allDebug };
-    }
-    return { streams: [], _debug: { ...allDebug, error: 'tmdb unknown title' } };
-  }
-  const promises = [];
+
+  const allDebug = { type, id, imdbId, season, episode, sources: [] };
+
+  // 🎬 MOVIES → YTS lang
   if (!isSeries) {
-    promises.push(fetchYTS(imdbId));
-  } else if (season && episode) {
-    promises.push(fetchEztv(imdbId, season, episode));
-    promises.push(fetch1337x(meta.title, season, episode));
-    promises.push(fetchTPB(meta.title, season, episode));
-    promises.push(fetchTorrentGalaxy(meta.title, season, episode));
-  } else {
+    const ytsResult = await fetchYTS(imdbId);
+    allDebug.sources.push(ytsResult.debug);
+    const streams = buildStreams(ytsResult.items, 'Movie', 'N/A', false, null, null);
+    return { streams, _debug: allDebug };
+  }
+
+  // 📺 SERIES → Torrentio lang
+  if (!season || !episode) {
     return { streams: [], _debug: { ...allDebug, error: 'missing season/episode' } };
   }
-  const settled = await Promise.allSettled(promises);
-  const merged = [];
-  for (const s of settled) {
-    if (s.status === 'fulfilled') {
-      merged.push(...s.value.items);
-      allDebug.sources.push(s.value.debug);
-    } else {
-      allDebug.sources.push({ error: s.reason?.message || String(s.reason) });
-    }
-  }
-  const streams = buildStreams(merged, meta.title, meta.year, isSeries, season, episode);
+
+  const tioResult = await fetchTorrentio('series', imdbId, season, episode);
+  allDebug.sources.push(tioResult.debug);
+  const streams = buildStreams(tioResult.items, 'Series', 'N/A', true, season, episode);
   return { streams, _debug: allDebug };
 }
 
@@ -523,12 +292,15 @@ export default {
   async fetch(request) {
     const url = new URL(request.url);
     const path = url.pathname;
+
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS });
     }
+
     if (path === '/manifest.json' || path === '/') {
       return new Response(JSON.stringify(MANIFEST), { headers: CORS });
     }
+
     const debugMatch = path.match(/^\/debug\/([^/]+)\/(.+)\.json$/);
     if (debugMatch) {
       const type = debugMatch[1];
@@ -540,6 +312,7 @@ export default {
         return new Response(JSON.stringify({ error: e.message, stack: e.stack }, null, 2), { headers: CORS });
       }
     }
+
     const streamMatch = path.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
     if (streamMatch) {
       const type = streamMatch[1];
@@ -551,6 +324,7 @@ export default {
         return new Response(JSON.stringify({ streams: [], error: e.message }), { headers: CORS });
       }
     }
+
     return new Response(JSON.stringify({ error: 'Not found' }), { status: 404, headers: CORS });
   }
 };
