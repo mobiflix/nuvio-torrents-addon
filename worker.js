@@ -1,7 +1,7 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v1.5.0)
+// NUVIO TORRENTS — Cloudflare Worker Addon (v1.6.0)
 // Movies:  YTS
-// Series:  EZTV + 1337x + ThePirateBay + SolidTorrents
+// Series:  EZTV + 1337x + ThePirateBay + TorrentGalaxy
 // ============================================================
 
 const TMDB_API_KEY = '1865f43a0549ca50d341dd9ab8b29f49';
@@ -12,7 +12,7 @@ const QUALITY_LABEL = '1080p';
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-  'Accept': 'application/json'
+  'Accept': 'text/html,application/json,*/*'
 };
 
 const TRACKERS = [
@@ -35,12 +35,11 @@ const CORS = {
   'Content-Type': 'application/json'
 };
 
-// ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '1.5.0',
+  version: '1.6.0',
   name: 'MobiFlix',
-  description: '1080p torrent magnet links — YTS + EZTV + 1337x + ThePirateBay + SolidTorrents.',
+  description: '1080p torrent magnet links — YTS + EZTV + 1337x + ThePirateBay + TorrentGalaxy.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
   author: 'Nuvio Team',
   types: ['movie', 'series'],
@@ -121,11 +120,9 @@ async function fetchYTS(imdbId) {
         const seeds = parseInt(t.seeds) || 0;
         if (seeds < MIN_SEEDS_MOVIE) continue;
         out.push({
-          source: 'YTS',
-          hash: t.hash,
+          source: 'YTS', hash: t.hash,
           filename: movie.title + ' ' + t.quality,
-          seeds,
-          peers: parseInt(t.peers) || 0,
+          seeds, peers: parseInt(t.peers) || 0,
           sizeBytes: parseSizeBytes(t.size, t),
           magnet: buildMagnet(t.hash, movie.title)
         });
@@ -152,7 +149,6 @@ async function fetchEztv(imdbId, season, episode) {
       return { items: [], debug };
     }
     debug.totalFetched = data.torrents.length;
-
     const out = [];
     const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0 };
     for (const t of data.torrents) {
@@ -164,11 +160,8 @@ async function fetchEztv(imdbId, season, episode) {
       const seeds = parseInt(t.seeds) || 0;
       if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
       out.push({
-        source: 'EZTV',
-        hash: t.hash,
-        filename: t.filename,
-        seeds,
-        peers: parseInt(t.peers) || 0,
+        source: 'EZTV', hash: t.hash, filename: t.filename,
+        seeds, peers: parseInt(t.peers) || 0,
         sizeBytes: parseInt(t.size_bytes) || 0,
         magnet: t.magnet_url || buildMagnet(t.hash, t.filename)
       });
@@ -206,17 +199,13 @@ async function fetch1337x(title, season, episode) {
         if (Array.isArray(arr)) {
           for (const t of arr) {
             if (t && t.info_hash && !seen.has(t.info_hash) && t.info_hash !== '0000000000000000000000000000000000000000') {
-              seen.add(t.info_hash);
-              all.push(t);
+              seen.add(t.info_hash); all.push(t);
             }
           }
         }
-      } catch (err) {
-        debug.rawCounts.push({ q, error: err.message });
-      }
+      } catch (err) { debug.rawCounts.push({ q, error: err.message }); }
     }
     debug.totalFetched = all.length;
-
     const out = [];
     const tWords = titleWords(title);
     const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0, titleMismatch: 0 };
@@ -229,11 +218,8 @@ async function fetch1337x(title, season, episode) {
       const matched = tWords.filter(w => nameNorm.includes(w));
       if (matched.length < 1) { reasonCount.titleMismatch++; continue; }
       out.push({
-        source: '1337x',
-        hash: t.info_hash,
-        filename: t.name,
-        seeds,
-        peers: parseInt(t.leechers) || 0,
+        source: '1337x', hash: t.info_hash, filename: t.name,
+        seeds, peers: parseInt(t.leechers) || 0,
         sizeBytes: parseInt(t.size) || 0,
         magnet: buildMagnet(t.info_hash, t.name)
       });
@@ -272,17 +258,13 @@ async function fetchTPB(title, season, episode) {
         if (Array.isArray(arr)) {
           for (const t of arr) {
             if (t && t.info_hash && !seen.has(t.info_hash) && t.info_hash !== '0000000000000000000000000000000000000000') {
-              seen.add(t.info_hash);
-              all.push(t);
+              seen.add(t.info_hash); all.push(t);
             }
           }
         }
-      } catch (err) {
-        debug.rawCounts.push({ q, error: err.message });
-      }
+      } catch (err) { debug.rawCounts.push({ q, error: err.message }); }
     }
     debug.totalFetched = all.length;
-
     const out = [];
     const tWords = titleWords(title);
     const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0, titleMismatch: 0 };
@@ -295,11 +277,8 @@ async function fetchTPB(title, season, episode) {
       const matched = tWords.filter(w => nameNorm.includes(w));
       if (matched.length < 1) { reasonCount.titleMismatch++; continue; }
       out.push({
-        source: 'ThePirateBay',
-        hash: t.info_hash,
-        filename: t.name,
-        seeds,
-        peers: parseInt(t.leechers) || 0,
+        source: 'ThePirateBay', hash: t.info_hash, filename: t.name,
+        seeds, peers: parseInt(t.leechers) || 0,
         sizeBytes: parseInt(t.size) || 0,
         magnet: buildMagnet(t.info_hash, t.name)
       });
@@ -313,48 +292,67 @@ async function fetchTPB(title, season, episode) {
   }
 }
 
-// ============ SOURCE: SolidTorrents ============
-async function fetchSolidTorrents(title, season, episode) {
-  const debug = { source: 'SolidTorrents', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0, sample: [] };
+// ============ SOURCE: TorrentGalaxy (direct fetch, walang proxy) ============
+async function fetchTorrentGalaxy(title, season, episode) {
+  const debug = { source: 'TorrentGalaxy', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0, sample: [] };
   try {
     const s = String(season).padStart(2, '0');
     const e = String(episode).padStart(2, '0');
     const queries = [
       title + ' S' + s + 'E' + e + ' 1080p',
-      title + ' S' + s + 'E' + e
+      title + ' S' + s + 'E' + e,
+      title + ' ' + s + 'x' + e + ' 1080p'
     ];
 
     const seen = new Set();
     const all = [];
 
     for (const q of queries) {
-      const endpoints = [
-        'https://solidtorrents.to/api/v1/search?q=' + encodeURIComponent(q) + '&sort=seeders',
-        'https://solidtorrents.net/api/v1/search?q=' + encodeURIComponent(q) + '&sort=seeders'
-      ];
-      for (const url of endpoints) {
-        try {
-          debug.urls.push(url);
-          const res = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
-          const results = res?.results || [];
-          debug.rawCounts.push({ q, url, count: results.length });
+      try {
+        // TorrentGalaxy search API endpoint (JSON, minsan HTML kung API fails)
+        const url = 'https://torrentgalaxy.to/torrents.php?search=' + encodeURIComponent(q) +
+                    '&sort=seeders&order=desc&nox=2&nox=1';
+        debug.urls.push(url);
+        const res = await fetch(url, { headers: HEADERS }).then(r => r.text()).catch(() => null);
+        if (!res) { debug.rawCounts.push({ q, error: 'no response' }); continue; }
 
-          for (const r of results) {
-            const hash = (r.infohash || r.infoHash || '').toLowerCase();
-            if (!hash || hash.length !== 40 || seen.has(hash)) continue;
-            seen.add(hash);
-            all.push({
-              name: r.title || r.name || '',
-              info_hash: hash,
-              seeders: String(r.swarm?.seeders ?? r.seeders ?? 0),
-              leechers: String(r.swarm?.leechers ?? r.leechers ?? 0),
-              size: String(r.size ?? 0)
-            });
-          }
-          if (results.length > 0) break; // kung may results na, huwag nang subukan ibang endpoint
-        } catch (err) {
-          debug.rawCounts.push({ q, url, error: err.message });
+        // Parse HTML para sa torrent entries
+        // Look for pattern: <a href="/torrent/HASH/...">NAME</a>
+        const regex = /<a href="\/torrent\/([a-f0-9]{40})\/([^"]+)"[^>]*>([^<]+)<\/a>/gi;
+        let match;
+        const found = [];
+        while ((match = regex.exec(res)) !== null) {
+          const hash = match[1].toLowerCase();
+          const name = (match[3] || '').trim();
+          if (!hash || hash.length !== 40 || seen.has(hash)) continue;
+          if (!name) continue;
+          seen.add(hash);
+          found.push({ name, hash });
         }
+
+        // Hanapin din ang seeders count malapit sa bawat entry
+        // Mas simple: mag-extract ng seeders via second regex
+        const seedRegex = /<td[^>]*class="[^"]*seeders[^"]*"[^>]*>(\d+)<\/td>/gi;
+        const seedersArr = [];
+        let sMatch;
+        while ((sMatch = seedRegex.exec(res)) !== null) {
+          seedersArr.push(parseInt(sMatch[1]) || 0);
+        }
+
+        // Pagsamahin
+        for (let i = 0; i < found.length; i++) {
+          all.push({
+            name: found[i].name,
+            info_hash: found[i].hash,
+            seeders: String(seedersArr[i] || 0),
+            leechers: '0',
+            size: '0'
+          });
+        }
+
+        debug.rawCounts.push({ q, count: found.length });
+      } catch (err) {
+        debug.rawCounts.push({ q, error: err.message });
       }
     }
     debug.totalFetched = all.length;
@@ -378,11 +376,8 @@ async function fetchSolidTorrents(title, season, episode) {
       const matched = tWords.filter(w => nameNorm.includes(w));
       if (matched.length < 1) { reasonCount.titleMismatch++; continue; }
       out.push({
-        source: 'SolidTorrents',
-        hash: t.info_hash,
-        filename: t.name,
-        seeds,
-        peers: parseInt(t.leechers) || 0,
+        source: 'TorrentGalaxy', hash: t.info_hash, filename: t.name,
+        seeds, peers: parseInt(t.leechers) || 0,
         sizeBytes: parseInt(t.size) || 0,
         magnet: buildMagnet(t.info_hash, t.name)
       });
@@ -403,7 +398,6 @@ async function lookupTmdb(imdbId, isSeries) {
       '?api_key=' + TMDB_API_KEY + '&external_source=imdb_id';
     const data = await fetch(url).then(r => r.json()).catch(() => null);
     if (!data) return { title: 'Unknown', year: 'N/A', imdbId };
-
     if (isSeries) {
       if (data.tv_results && data.tv_results[0]) {
         const item = data.tv_results[0];
@@ -421,7 +415,6 @@ async function lookupTmdb(imdbId, isSeries) {
       }
       return { title: 'Unknown', year: 'N/A', imdbId };
     }
-
     if (data.movie_results && data.movie_results[0]) {
       const item = data.movie_results[0];
       return { title: item.title || 'Unknown', year: (item.release_date || 'N/A').split('-')[0], imdbId };
@@ -442,9 +435,7 @@ function buildStreams(items, title, year, isSeries, season, episode) {
     unique.push(item);
   }
   if (!unique.length) return [];
-
   unique.sort((a, b) => b.seeds - a.seeds || a.sizeBytes - b.sizeBytes);
-
   return unique.map(item => {
     const sizeGB = (item.sizeBytes / 1073741824).toFixed(2);
     const extras = [];
@@ -455,22 +446,16 @@ function buildStreams(items, title, year, isSeries, season, episode) {
     if (/\bATMOS\b/i.test(item.filename)) extras.push('ATMOS');
     if (/\bDTS\b/i.test(item.filename)) extras.push('DTS');
     if (/\b5\.1\b/i.test(item.filename)) extras.push('5.1');
-
     const titleLine = isSeries
       ? '🎬 ' + title + ' S' + String(season).padStart(2, '0') + ' E' + String(episode).padStart(2, '0')
       : '🎬 ' + title + ' (' + year + ')';
     const qualityLine = '🔥 ' + QUALITY_LABEL + (extras.length ? ' | ' + extras.join(' | ') : '');
     const statsLine = '🌱 ' + item.seeds + ' | 💾 ' + sizeGB + ' GB | 🔗 ' + item.source;
     const description = titleLine + '\n' + qualityLine + '\n' + statsLine;
-
     return {
       name: item.source + ' | ' + QUALITY_LABEL.toUpperCase() + ' | 🌱 ' + item.seeds,
-      title: description,
-      description: description,
-      url: item.magnet,
-      behaviorHints: {
-        bingeGroup: 'nuvio-torrents-' + item.source + '-1080p'
-      }
+      title: description, description: description, url: item.magnet,
+      behaviorHints: { bingeGroup: 'nuvio-torrents-' + item.source + '-1080p' }
     };
   });
 }
@@ -493,14 +478,11 @@ function parseId(id) {
 async function handleStream(type, id) {
   const isSeries = type === 'series' || type === 'tv';
   const { imdbId, season, episode } = parseId(id);
-
   if (!imdbId || !/^tt\d+$/.test(imdbId)) {
     return { streams: [], _debug: { error: 'invalid imdb', id } };
   }
-
   const meta = await lookupTmdb(imdbId, isSeries);
   const allDebug = { type, id, imdbId, season, episode, meta, sources: [] };
-
   if (meta.title === 'Unknown') {
     if (isSeries && season && episode) {
       const eztvResult = await fetchEztv(imdbId, season, episode);
@@ -511,7 +493,6 @@ async function handleStream(type, id) {
     }
     return { streams: [], _debug: { ...allDebug, error: 'tmdb unknown title' } };
   }
-
   const promises = [];
   if (!isSeries) {
     promises.push(fetchYTS(imdbId));
@@ -519,11 +500,10 @@ async function handleStream(type, id) {
     promises.push(fetchEztv(imdbId, season, episode));
     promises.push(fetch1337x(meta.title, season, episode));
     promises.push(fetchTPB(meta.title, season, episode));
-    promises.push(fetchSolidTorrents(meta.title, season, episode));
+    promises.push(fetchTorrentGalaxy(meta.title, season, episode));
   } else {
     return { streams: [], _debug: { ...allDebug, error: 'missing season/episode' } };
   }
-
   const settled = await Promise.allSettled(promises);
   const merged = [];
   for (const s of settled) {
@@ -534,7 +514,6 @@ async function handleStream(type, id) {
       allDebug.sources.push({ error: s.reason?.message || String(s.reason) });
     }
   }
-
   const streams = buildStreams(merged, meta.title, meta.year, isSeries, season, episode);
   return { streams, _debug: allDebug };
 }
@@ -544,15 +523,12 @@ export default {
   async fetch(request) {
     const url = new URL(request.url);
     const path = url.pathname;
-
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS });
     }
-
     if (path === '/manifest.json' || path === '/') {
       return new Response(JSON.stringify(MANIFEST), { headers: CORS });
     }
-
     const debugMatch = path.match(/^\/debug\/([^/]+)\/(.+)\.json$/);
     if (debugMatch) {
       const type = debugMatch[1];
@@ -564,7 +540,6 @@ export default {
         return new Response(JSON.stringify({ error: e.message, stack: e.stack }, null, 2), { headers: CORS });
       }
     }
-
     const streamMatch = path.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
     if (streamMatch) {
       const type = streamMatch[1];
@@ -576,7 +551,6 @@ export default {
         return new Response(JSON.stringify({ streams: [], error: e.message }), { headers: CORS });
       }
     }
-
     return new Response(JSON.stringify({ error: 'Not found' }), { status: 404, headers: CORS });
   }
 };
