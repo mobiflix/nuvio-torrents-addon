@@ -1,7 +1,7 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v1.3.0)
-// Movies:  YTS (1080p, min 15 seeds)
-// Series:  EZTV + 1337x + ThePirateBay (1080p, min 3 seeds)
+// NUVIO TORRENTS — Cloudflare Worker Addon (v1.4.0)
+// Movies:  YTS
+// Series:  EZTV + 1337x (apibay) + ThePirateBay (apibay) + Knaben
 // ============================================================
 
 const TMDB_API_KEY = '1865f43a0549ca50d341dd9ab8b29f49';
@@ -38,9 +38,9 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '1.3.0',
+  version: '1.4.0',
   name: 'MobiFlix',
-  description: '1080p torrent magnet links — YTS + EZTV + 1337x + ThePirateBay.',
+  description: '1080p torrent magnet links — YTS + EZTV + 1337x + ThePirateBay + Knaben.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
   author: 'Nuvio Team',
   types: ['movie', 'series'],
@@ -114,7 +114,6 @@ async function fetchYTS(imdbId) {
       debug.error = 'no movies found';
       return { items: [], debug };
     }
-
     const out = [];
     for (const movie of data.data.movies) {
       for (const t of (movie.torrents || [])) {
@@ -142,7 +141,7 @@ async function fetchYTS(imdbId) {
 
 // ============ SOURCE: EZTV ============
 async function fetchEztv(imdbId, season, episode) {
-  const debug = { source: 'EZTV', url: '', count: 0, error: null, totalFetched: 0, sample: [] };
+  const debug = { source: 'EZTV', url: '', count: 0, error: null, totalFetched: 0 };
   try {
     const numericId = String(imdbId).replace(/^tt/, '');
     const url = 'https://eztvx.to/api/get-torrents?imdb_id=' + numericId + '&limit=100';
@@ -153,13 +152,6 @@ async function fetchEztv(imdbId, season, episode) {
       return { items: [], debug };
     }
     debug.totalFetched = data.torrents.length;
-    debug.sample = data.torrents.slice(0, 3).map(t => ({
-      filename: t.filename,
-      season: t.season,
-      episode: t.episode,
-      seeds: t.seeds,
-      is1080p: is1080p(t.filename || '')
-    }));
 
     const out = [];
     const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0 };
@@ -171,7 +163,6 @@ async function fetchEztv(imdbId, season, episode) {
       if (!is1080p(t.filename)) { reasonCount.not1080p++; continue; }
       const seeds = parseInt(t.seeds) || 0;
       if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
-
       out.push({
         source: 'EZTV',
         hash: t.hash,
@@ -237,7 +228,6 @@ async function fetch1337x(title, season, episode) {
       const nameNorm = normalizeTitle(t.name);
       const matched = tWords.filter(w => nameNorm.includes(w));
       if (matched.length < Math.max(1, Math.floor(tWords.length * 0.4))) { reasonCount.titleMismatch++; continue; }
-
       out.push({
         source: '1337x',
         hash: t.info_hash,
@@ -263,11 +253,10 @@ async function fetchTPB(title, season, episode) {
   try {
     const s = String(season).padStart(2, '0');
     const e = String(episode).padStart(2, '0');
-    // TPB ay mas effective sa mas simpleng query — marami itong re-release ng TV packs
     const queries = [
       title + ' S' + s + 'E' + e + ' 1080p',
       title + ' S' + s + 'E' + e,
-      title + ' S' + s + ' 1080p',      // season pack (minsan kasama ep)
+      title + ' S' + s + ' 1080p',
       title + ' ' + s + 'x' + e + ' 1080p',
       title + ' ' + season + 'x' + e
     ];
@@ -305,7 +294,6 @@ async function fetchTPB(title, season, episode) {
       const nameNorm = normalizeTitle(t.name);
       const matched = tWords.filter(w => nameNorm.includes(w));
       if (matched.length < Math.max(1, Math.floor(tWords.length * 0.4))) { reasonCount.titleMismatch++; continue; }
-
       out.push({
         source: 'ThePirateBay',
         hash: t.info_hash,
@@ -325,7 +313,100 @@ async function fetchTPB(title, season, episode) {
   }
 }
 
-// ============ TMDB LOOKUP (may episode-ID fallback) ============
+// ============ SOURCE: Knaben (aggregator, hindi apibay) ============
+// Knaben ay nag-a-aggregate ng 1337x, TPB, RARBG, YTS, EZTV, TorrentGalaxy at iba pa
+// Public API, walang key, JSON search
+async function fetchKnaben(title, season, episode) {
+  const debug = { source: 'Knaben', urls: [], count: 0, error: null, rawCounts: [], totalFetched: 0 };
+  try {
+    const s = String(season).padStart(2, '0');
+    const e = String(episode).padStart(2, '0');
+    const queries = [
+      title + ' S' + s + 'E' + e + ' 1080p',
+      title + ' S' + s + 'E' + e,
+      title + ' 1080p S' + s
+    ];
+
+    const seen = new Set();
+    const all = [];
+
+    for (const q of queries) {
+      try {
+        const url = 'https://api.knaben.org/v1';
+        debug.urls.push(url + ' [q=' + q + ']');
+
+        const body = JSON.stringify({
+          search_type: 'score',
+          search_field: 'title',
+          query: q,
+          order_by: 'seeders',
+          order_direction: 'desc',
+          size: 50,
+          hide_unsafe: true,
+          hide_xxx: true
+        });
+
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            ...HEADERS,
+            'Content-Type': 'application/json'
+          },
+          body
+        }).then(r => r.json()).catch(() => null);
+
+        const hits = res?.hits || [];
+        debug.rawCounts.push({ q, count: hits.length });
+
+        for (const h of hits) {
+          const hash = (h.hash || '').toLowerCase();
+          if (!hash || hash.length !== 40 || seen.has(hash)) continue;
+          seen.add(hash);
+          all.push({
+            name: h.title || '',
+            info_hash: hash,
+            seeders: String(h.seeders || 0),
+            leechers: String(h.peers || 0),
+            size: String(h.bytes || 0)
+          });
+        }
+      } catch (err) {
+        debug.rawCounts.push({ q, error: err.message });
+      }
+    }
+    debug.totalFetched = all.length;
+
+    const out = [];
+    const tWords = titleWords(title);
+    const reasonCount = { seMismatch: 0, not1080p: 0, lowSeeds: 0, titleMismatch: 0 };
+    for (const t of all) {
+      if (!matchesSe(t.name, season, episode)) { reasonCount.seMismatch++; continue; }
+      if (!is1080p(t.name)) { reasonCount.not1080p++; continue; }
+      const seeds = parseInt(t.seeders) || 0;
+      if (seeds < MIN_SEEDS_SERIES) { reasonCount.lowSeeds++; continue; }
+      const nameNorm = normalizeTitle(t.name);
+      const matched = tWords.filter(w => nameNorm.includes(w));
+      if (matched.length < Math.max(1, Math.floor(tWords.length * 0.4))) { reasonCount.titleMismatch++; continue; }
+      out.push({
+        source: 'Knaben',
+        hash: t.info_hash,
+        filename: t.name,
+        seeds,
+        peers: parseInt(t.leechers) || 0,
+        sizeBytes: parseInt(t.size) || 0,
+        magnet: buildMagnet(t.info_hash, t.name)
+      });
+    }
+    debug.reasonCount = reasonCount;
+    debug.count = out.length;
+    return { items: out, debug };
+  } catch (e) {
+    debug.error = e?.message || String(e);
+    return { items: [], debug };
+  }
+}
+
+// ============ TMDB LOOKUP ============
 async function lookupTmdb(imdbId, isSeries) {
   try {
     const url = 'https://api.themoviedb.org/3/find/' + imdbId +
@@ -336,11 +417,7 @@ async function lookupTmdb(imdbId, isSeries) {
     if (isSeries) {
       if (data.tv_results && data.tv_results[0]) {
         const item = data.tv_results[0];
-        return {
-          title: item.name || 'Unknown',
-          year: (item.first_air_date || 'N/A').split('-')[0],
-          imdbId
-        };
+        return { title: item.name || 'Unknown', year: (item.first_air_date || 'N/A').split('-')[0], imdbId };
       }
       if (data.tv_episode_results && data.tv_episode_results[0]) {
         const ep = data.tv_episode_results[0];
@@ -348,12 +425,7 @@ async function lookupTmdb(imdbId, isSeries) {
           const showUrl = 'https://api.themoviedb.org/3/tv/' + ep.show_id + '?api_key=' + TMDB_API_KEY;
           const show = await fetch(showUrl).then(r => r.json()).catch(() => null);
           if (show && show.name) {
-            return {
-              title: show.name,
-              year: (show.first_air_date || 'N/A').split('-')[0],
-              imdbId,
-              note: 'resolved from episode ID'
-            };
+            return { title: show.name, year: (show.first_air_date || 'N/A').split('-')[0], imdbId, note: 'resolved from episode ID' };
           }
         }
       }
@@ -362,11 +434,7 @@ async function lookupTmdb(imdbId, isSeries) {
 
     if (data.movie_results && data.movie_results[0]) {
       const item = data.movie_results[0];
-      return {
-        title: item.title || 'Unknown',
-        year: (item.release_date || 'N/A').split('-')[0],
-        imdbId
-      };
+      return { title: item.title || 'Unknown', year: (item.release_date || 'N/A').split('-')[0], imdbId };
     }
     return { title: 'Unknown', year: 'N/A', imdbId };
   } catch (e) {
@@ -376,6 +444,7 @@ async function lookupTmdb(imdbId, isSeries) {
 
 // ============ BUILD STREAMS ============
 function buildStreams(items, title, year, isSeries, season, episode) {
+  // Dedup by hash — pwedeng may duplicates sa Knaben + 1337x + TPB
   const seen = new Set();
   const unique = [];
   for (const item of items) {
@@ -445,24 +514,31 @@ async function handleStream(type, id) {
 
   if (meta.title === 'Unknown') {
     if (isSeries && season && episode) {
-      const eztvResult = await fetchEztv(imdbId, season, episode);
-      allDebug.sources.push(eztvResult.debug);
-      allDebug.tmdbFailed = true;
-      const fallbackStreams = buildStreams(eztvResult.items, 'Unknown', 'N/A', isSeries, season, episode);
-      return { streams: fallbackStreams, _debug: allDebug };
+      // Fallback: EZTV (imdb-based) + Knaben (title-based pa rin pero walang TMDB required kung may title na)
+      const [eztvR, knabenR] = await Promise.allSettled([
+        fetchEztv(imdbId, season, episode),
+        // Wala tayong title kaya skip muna Knaben kung Unknown
+      ]);
+      if (eztvR.status === 'fulfilled') {
+        allDebug.sources.push(eztvR.value.debug);
+        allDebug.tmdbFailed = true;
+        const fallbackStreams = buildStreams(eztvR.value.items, 'Unknown', 'N/A', isSeries, season, episode);
+        return { streams: fallbackStreams, _debug: allDebug };
+      }
     }
     return { streams: [], _debug: { ...allDebug, error: 'tmdb unknown title' } };
   }
 
   const promises = [];
   if (!isSeries) {
-    // 🎬 MOVIES — YTS lang (hindi ginalaw)
+    // 🎬 MOVIES — YTS lang
     promises.push(fetchYTS(imdbId));
   } else if (season && episode) {
-    // 📺 SERIES — EZTV + 1337x + ThePirateBay
+    // 📺 SERIES — lahat ng sources (may dedup sa buildStreams)
     promises.push(fetchEztv(imdbId, season, episode));
     promises.push(fetch1337x(meta.title, season, episode));
     promises.push(fetchTPB(meta.title, season, episode));
+    promises.push(fetchKnaben(meta.title, season, episode));
   } else {
     return { streams: [], _debug: { ...allDebug, error: 'missing season/episode' } };
   }
