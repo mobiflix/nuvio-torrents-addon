@@ -1,12 +1,13 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon
+// NUVIO TORRENTS — Cloudflare Worker Addon (v1.1.0)
 // Sources: YTS + EZTV + 1337x (via apibay)
-// Quality: 1080p only | Min 15 seeders
+// Quality: 1080p only
 // ============================================================
 
 const TMDB_API_KEY = '1865f43a0549ca50d341dd9ab8b29f49';
 const YTS_API_BASE = 'https://movies-api.accel.li/api/v2';
-const MIN_SEEDS = 15;
+const MIN_SEEDS_MOVIE = 15;
+const MIN_SEEDS_SERIES = 5;   // mas mababa para sa series
 const QUALITY_LABEL = '1080p';
 
 const HEADERS = {
@@ -37,9 +38,9 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'MobiFlix',
-  description: '1080p torrent magnet links — YTS + EZTV + 1337x. Movies at series. Minimum 15 seeders.',
+  description: '1080p torrent magnet links — YTS + EZTV + 1337x.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
   author: 'Nuvio Team',
   types: ['movie', 'series'],
@@ -104,17 +105,22 @@ function parseSizeBytes(sizeStr, torrent) {
 
 // ============ SOURCE: YTS ============
 async function fetchYTS(imdbId) {
+  const debug = { source: 'YTS', url: '', count: 0, error: null };
   try {
     const url = YTS_API_BASE + '/list_movies.json?query_term=' + encodeURIComponent(imdbId);
+    debug.url = url;
     const data = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
-    if (!data?.data?.movies?.length) return [];
+    if (!data?.data?.movies?.length) {
+      debug.error = 'no movies found';
+      return { items: [], debug };
+    }
 
     const out = [];
     for (const movie of data.data.movies) {
       for (const t of (movie.torrents || [])) {
         if (t.quality !== '1080p') continue;
         const seeds = parseInt(t.seeds) || 0;
-        if (seeds < MIN_SEEDS) continue;
+        if (seeds < MIN_SEEDS_MOVIE) continue;
         out.push({
           source: 'YTS',
           hash: t.hash,
@@ -126,19 +132,28 @@ async function fetchYTS(imdbId) {
         });
       }
     }
-    return out;
+    debug.count = out.length;
+    return { items: out, debug };
   } catch (e) {
-    console.error('[YTS] error:', e?.message || e);
-    return [];
+    debug.error = e?.message || String(e);
+    return { items: [], debug };
   }
 }
 
 // ============ SOURCE: EZTV ============
 async function fetchEztv(imdbId, season, episode) {
+  const debug = { source: 'EZTV', url: '', count: 0, error: null };
   try {
-    const url = 'https://eztvx.to/api/get-torrents?imdb_id=' + imdbId + '&limit=100';
+    // EZTV requires NUMERIC imdb_id (no "tt")
+    const numericId = String(imdbId).replace(/^tt/, '');
+    const url = 'https://eztvx.to/api/get-torrents?imdb_id=' + numericId + '&limit=100';
+    debug.url = url;
     const data = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
-    if (!data?.torrents || !Array.isArray(data.torrents)) return [];
+    if (!data?.torrents || !Array.isArray(data.torrents)) {
+      debug.error = 'no torrents array';
+      return { items: [], debug };
+    }
+    debug.totalFetched = data.torrents.length;
 
     const out = [];
     for (const t of data.torrents) {
@@ -146,7 +161,7 @@ async function fetchEztv(imdbId, season, episode) {
       if (String(t.season) !== String(season) || String(t.episode) !== String(episode)) continue;
       if (!is1080p(t.filename)) continue;
       const seeds = parseInt(t.seeds) || 0;
-      if (seeds < MIN_SEEDS) continue;
+      if (seeds < MIN_SEEDS_SERIES) continue;
       out.push({
         source: 'EZTV',
         hash: t.hash,
@@ -157,25 +172,29 @@ async function fetchEztv(imdbId, season, episode) {
         magnet: t.magnet_url || buildMagnet(t.hash, t.filename)
       });
     }
-    return out;
+    debug.count = out.length;
+    return { items: out, debug };
   } catch (e) {
-    console.error('[EZTV] error:', e?.message || e);
-    return [];
+    debug.error = e?.message || String(e);
+    return { items: [], debug };
   }
 }
 
 // ============ SOURCE: 1337x (via apibay) ============
 async function fetch1337x(title, season, episode) {
+  const debug = { source: '1337x', urls: [], count: 0, error: null };
   try {
     const queries = [
       title + ' S' + String(season).padStart(2, '0') + 'E' + String(episode).padStart(2, '0') + ' 1080p',
-      title + ' S' + String(season).padStart(2, '0') + 'E' + String(episode).padStart(2, '0') + ' x265'
+      title + ' S' + String(season).padStart(2, '0') + 'E' + String(episode).padStart(2, '0') + ' x265',
+      title + ' ' + season + 'x' + String(episode).padStart(2, '0') + ' 1080p'
     ];
     const seen = new Set();
     const all = [];
     for (const q of queries) {
       try {
         const url = 'https://apibay.org/q.php?q=' + encodeURIComponent(q) + '&cat=0';
+        debug.urls.push(url);
         const arr = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
         if (Array.isArray(arr)) {
           for (const t of arr) {
@@ -187,6 +206,7 @@ async function fetch1337x(title, season, episode) {
         }
       } catch (_) {}
     }
+    debug.totalFetched = all.length;
 
     const out = [];
     const tWords = titleWords(title);
@@ -194,7 +214,7 @@ async function fetch1337x(title, season, episode) {
       if (!matchesSe(t.name, season, episode)) continue;
       if (!is1080p(t.name)) continue;
       const seeds = parseInt(t.seeders) || 0;
-      if (seeds < MIN_SEEDS) continue;
+      if (seeds < MIN_SEEDS_SERIES) continue;
       const nameNorm = normalizeTitle(t.name);
       const matched = tWords.filter(w => nameNorm.includes(w));
       if (matched.length < Math.max(1, Math.floor(tWords.length * 0.5))) continue;
@@ -209,10 +229,11 @@ async function fetch1337x(title, season, episode) {
         magnet: buildMagnet(t.info_hash, t.name)
       });
     }
-    return out;
+    debug.count = out.length;
+    return { items: out, debug };
   } catch (e) {
-    console.error('[1337x] error:', e?.message || e);
-    return [];
+    debug.error = e?.message || String(e);
+    return { items: [], debug };
   }
 }
 
@@ -280,33 +301,59 @@ function buildStreams(items, title, year, isSeries, season, episode) {
   });
 }
 
-// ============ STREAM HANDLER ============
-async function handleStream(type, id) {
+// ============ ID PARSER ============
+function parseId(id) {
   const parts = String(id).split(':');
   const imdbId = parts[0];
-  const isSeries = type === 'series' || type === 'tv';
-  const season = parts[1] ? parseInt(parts[1]) : null;
-  const episode = parts[2] ? parseInt(parts[2]) : null;
+  let season = null, episode = null;
+  if (parts.length >= 3) {
+    season = parseInt(String(parts[1]).replace(/^S/i, ''));
+    episode = parseInt(String(parts[2]).replace(/^E/i, ''));
+  } else if (parts.length === 2) {
+    season = parseInt(String(parts[1]).replace(/^S/i, ''));
+  }
+  return { imdbId, season, episode };
+}
 
-  if (!imdbId || !/^tt\d+$/.test(imdbId)) return { streams: [] };
+// ============ STREAM HANDLER ============
+async function handleStream(type, id) {
+  const isSeries = type === 'series' || type === 'tv';
+  const { imdbId, season, episode } = parseId(id);
+
+  if (!imdbId || !/^tt\d+$/.test(imdbId)) {
+    return { streams: [], _debug: { error: 'invalid imdb', id } };
+  }
 
   const meta = await lookupTmdb(imdbId, isSeries);
-  if (meta.title === 'Unknown' && !isSeries) return { streams: [] };
+  const allDebug = { type, id, imdbId, season, episode, meta, sources: [] };
 
-  const promises = [fetchYTS(imdbId)];
-  if (isSeries && season && episode) {
+  if (meta.title === 'Unknown') {
+    return { streams: [], _debug: { ...allDebug, error: 'tmdb unknown title' } };
+  }
+
+  const promises = [];
+  if (!isSeries) {
+    promises.push(fetchYTS(imdbId));
+  } else if (season && episode) {
     promises.push(fetchEztv(imdbId, season, episode));
     promises.push(fetch1337x(meta.title, season, episode));
+  } else {
+    return { streams: [], _debug: { ...allDebug, error: 'missing season/episode' } };
   }
 
   const settled = await Promise.allSettled(promises);
   const merged = [];
   for (const s of settled) {
-    if (s.status === 'fulfilled' && Array.isArray(s.value)) merged.push(...s.value);
+    if (s.status === 'fulfilled') {
+      merged.push(...s.value.items);
+      allDebug.sources.push(s.value.debug);
+    } else {
+      allDebug.sources.push({ error: s.reason?.message || String(s.reason) });
+    }
   }
 
   const streams = buildStreams(merged, meta.title, meta.year, isSeries, season, episode);
-  return { streams };
+  return { streams, _debug: allDebug };
 }
 
 // ============ ROUTER ============
@@ -323,13 +370,27 @@ export default {
       return new Response(JSON.stringify(MANIFEST), { headers: CORS });
     }
 
+    // 🔥 DEBUG endpoint — buksan ito sa browser para makita kung saan nawawala
+    const debugMatch = path.match(/^\/debug\/([^/]+)\/(.+)\.json$/);
+    if (debugMatch) {
+      const type = debugMatch[1];
+      const id = decodeURIComponent(debugMatch[2]);
+      try {
+        const result = await handleStream(type, id);
+        return new Response(JSON.stringify(result, null, 2), { headers: CORS });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message, stack: e.stack }, null, 2), { headers: CORS });
+      }
+    }
+
     const streamMatch = path.match(/^\/stream\/([^/]+)\/(.+)\.json$/);
     if (streamMatch) {
       const type = streamMatch[1];
       const id = decodeURIComponent(streamMatch[2]);
       try {
         const result = await handleStream(type, id);
-        return new Response(JSON.stringify(result), { headers: CORS });
+        // huwag isama ang _debug sa normal response
+        return new Response(JSON.stringify({ streams: result.streams }), { headers: CORS });
       } catch (e) {
         return new Response(JSON.stringify({ streams: [], error: e.message }), { headers: CORS });
       }
