@@ -5,7 +5,7 @@
 // ============================================================
 
 const YTS_API_BASE = 'https://movies-api.accel.li/api/v2';
-const MIN_SEEDS_MOVIE = 15;
+const MIN_SEEDS_MOVIE = 1;
 const QUALITY_LABEL = '1080p';
 
 const HEADERS = {
