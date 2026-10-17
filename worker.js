@@ -1,7 +1,8 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v3.2.0)
+// NUVIO TORRENTS — Cloudflare Worker Addon (v3.2.1)
 // Movies: YTS (1080p, min 15 seeds) + TPB (1080p, min 15 seeds)
-// Series: TPB only (S01E01 packs/episodes, 1080p, min 15 seeds)
+// Series: TPB only (S01E01, 1080p, min 15 seeds)
+// Sorting: YTS muna, tapos TPB. Within each: seeds desc, size asc.
 // ============================================================
 
 const YTS_API_BASE = 'https://movies-api.accel.li/api/v2';
@@ -12,6 +13,9 @@ const TMDB_BASE = 'https://api.themoviedb.org/3';
 const MIN_SEEDS_MOVIE = 15;
 const MIN_SEEDS_SERIES = 15;
 const QUALITY_LABEL = '1080p';
+
+// Source priority: mas maliit = mauuna
+const SOURCE_RANK = { YTS: 0, TPB: 1 };
 
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
@@ -41,7 +45,7 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '3.2.0',
+  version: '3.2.1',
   name: 'MobiFlix',
   description: 'YTS + The Pirate Bay torrents — 1080p, minimum 15 seeders. Movies & series.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
@@ -93,7 +97,6 @@ async function fetchJson(url) {
 
 // ============ TMDB (for TPB search titles) ============
 async function getTmdbInfo(imdbId, type) {
-  // type: 'movie' | 'tv'
   const findUrl = TMDB_BASE + '/find/' + imdbId +
     '?api_key=' + TMDB_API_KEY + '&language=en-US&external_source=imdb_id';
   const data = await fetchJson(findUrl);
@@ -133,6 +136,7 @@ async function fetchYTS(imdbId) {
         if (seeds < MIN_SEEDS_MOVIE) continue;
         out.push({
           source: 'YTS',
+          sourceRank: SOURCE_RANK.YTS,
           hash: t.hash,
           filename: movie.title + ' ' + t.quality,
           seeds,
@@ -160,7 +164,6 @@ async function fetchTPB(imdbId, mediaType, season, episode) {
       return { items: [], debug };
     }
 
-    // Build query
     let query = info.title;
     if (mediaType === 'tv' && season && episode) {
       const s = String(season).padStart(2, '0');
@@ -198,6 +201,7 @@ async function fetchTPB(imdbId, mediaType, season, episode) {
 
       out.push({
         source: 'TPB',
+        sourceRank: SOURCE_RANK.TPB,
         hash,
         filename: name.replace(/\.torrent$/i, ''),
         seeds,
@@ -225,8 +229,12 @@ function buildStreams(items) {
   }
   if (!unique.length) return [];
 
-  // Mataas na seeds muna; pag pantay, mas maliit na size muna
-  unique.sort((a, b) => b.seeds - a.seeds || a.sizeBytes - b.sizeBytes);
+  // YTS muna, tapos TPB. Within each: seeds desc, then size asc.
+  unique.sort((a, b) =>
+    (a.sourceRank - b.sourceRank) ||
+    (b.seeds - a.seeds) ||
+    (a.sizeBytes - b.sizeBytes)
+  );
 
   return unique.map(item => {
     const sizeGB = (item.sizeBytes / 1073741824).toFixed(2);
@@ -273,10 +281,7 @@ async function handleStream(type, id) {
 
   const allDebug = { type, id, imdbId, season, episode, sources: [] };
 
-  // YTS lang para sa movies. TPB para sa movies at series.
-  const tasks = [
-    fetchTPB(imdbId, mediaType, season, episode)
-  ];
+  const tasks = [fetchTPB(imdbId, mediaType, season, episode)];
   if (isMovie) tasks.unshift(fetchYTS(imdbId));
 
   const results = await Promise.all(tasks);
