@@ -1,11 +1,16 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v3.0.0)
-// Movies: YTS only (1080p, min 15 seeds)
-// Series: hindi supported (walang reliable na source)
+// NUVIO TORRENTS — Cloudflare Worker Addon (v3.2.0)
+// Movies: YTS (1080p, min 15 seeds) + TPB (1080p, min 15 seeds)
+// Series: TPB only (S01E01 packs/episodes, 1080p, min 15 seeds)
 // ============================================================
 
 const YTS_API_BASE = 'https://movies-api.accel.li/api/v2';
-const MIN_SEEDS_MOVIE = 1;
+const TPB_API_BASE = 'https://apibay.org';
+const TMDB_API_KEY = 'e0a7266a5d0e95c36475f349d8bc0a5a';
+const TMDB_BASE = 'https://api.themoviedb.org/3';
+
+const MIN_SEEDS_MOVIE = 15;
+const MIN_SEEDS_SERIES = 15;
 const QUALITY_LABEL = '1080p';
 
 const HEADERS = {
@@ -36,12 +41,12 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '3.0.0',
+  version: '3.2.0',
   name: 'MobiFlix',
-  description: 'YTS movie torrents — 1080p, minimum 15 seeders.',
+  description: 'YTS + The Pirate Bay torrents — 1080p, minimum 15 seeders. Movies & series.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
   author: 'Nuvio Team',
-  types: ['movie'],
+  types: ['movie', 'series'],
   idPrefixes: ['tt'],
   catalogs: [],
   resources: ['stream'],
@@ -72,13 +77,49 @@ function parseSizeBytes(sizeStr, torrent) {
   return 0;
 }
 
+function parseImdbFromId(id) {
+  const parts = String(id).split(':');
+  return {
+    imdbId: parts[0],
+    season: parts[1] ? parseInt(parts[1]) : null,
+    episode: parts[2] ? parseInt(parts[2]) : null
+  };
+}
+
+async function fetchJson(url) {
+  const res = await fetch(url, { headers: HEADERS });
+  return res.json();
+}
+
+// ============ TMDB (for TPB search titles) ============
+async function getTmdbInfo(imdbId, type) {
+  // type: 'movie' | 'tv'
+  const findUrl = TMDB_BASE + '/find/' + imdbId +
+    '?api_key=' + TMDB_API_KEY + '&language=en-US&external_source=imdb_id';
+  const data = await fetchJson(findUrl);
+  if (type === 'tv') {
+    const show = data?.tv_results?.[0];
+    if (!show) return { title: '', year: '' };
+    return {
+      title: show.name || '',
+      year: (show.first_air_date || '').split('-')[0] || ''
+    };
+  }
+  const movie = data?.movie_results?.[0];
+  if (!movie) return { title: '', year: '' };
+  return {
+    title: movie.title || '',
+    year: (movie.release_date || '').split('-')[0] || ''
+  };
+}
+
 // ============ SOURCE: YTS (MOVIES ONLY) ============
 async function fetchYTS(imdbId) {
   const debug = { source: 'YTS', url: '', count: 0, error: null };
   try {
     const url = YTS_API_BASE + '/list_movies.json?query_term=' + encodeURIComponent(imdbId);
     debug.url = url;
-    const data = await fetch(url, { headers: HEADERS }).then(r => r.json()).catch(() => null);
+    const data = await fetchJson(url).catch(() => null);
     if (!data?.data?.movies?.length) {
       debug.error = 'no movies found';
       return { items: [], debug };
@@ -109,7 +150,71 @@ async function fetchYTS(imdbId) {
   }
 }
 
-// ============ BUILD STREAMS ============
+// ============ SOURCE: THE PIRATE BAY (MOVIES + SERIES) ============
+async function fetchTPB(imdbId, mediaType, season, episode) {
+  const debug = { source: 'TPB', mediaType, url: '', count: 0, error: null };
+  try {
+    const info = await getTmdbInfo(imdbId, mediaType).catch(() => ({ title: '', year: '' }));
+    if (!info.title) {
+      debug.error = 'no tmdb title';
+      return { items: [], debug };
+    }
+
+    // Build query
+    let query = info.title;
+    if (mediaType === 'tv' && season && episode) {
+      const s = String(season).padStart(2, '0');
+      const e = String(episode).padStart(2, '0');
+      query += ' S' + s + 'E' + e;
+    } else if (mediaType === 'movie' && info.year) {
+      query += ' ' + info.year;
+    }
+    const url = TPB_API_BASE + '/q.php?q=' + encodeURIComponent(query);
+    debug.url = url;
+
+    const results = await fetchJson(url).catch(() => null);
+    if (!Array.isArray(results) || !results.length) {
+      debug.error = 'no results';
+      return { items: [], debug };
+    }
+    if (results[0]?.name === 'No results returned') {
+      debug.error = 'no results returned';
+      return { items: [], debug };
+    }
+
+    const out = [];
+    for (const item of results) {
+      const hash = item.info_hash;
+      if (!hash || hash === '0000000000000000000000000000000000000000') continue;
+
+      const name = item.name || '';
+      if (!/1080[pP]/.test(name)) continue;
+
+      const seeds = parseInt(item.seeders || '0', 10) || 0;
+      const minSeeds = mediaType === 'tv' ? MIN_SEEDS_SERIES : MIN_SEEDS_MOVIE;
+      if (seeds < minSeeds) continue;
+
+      const sizeBytes = parseInt(item.size || '0', 10) || 0;
+
+      out.push({
+        source: 'TPB',
+        hash,
+        filename: name.replace(/\.torrent$/i, ''),
+        seeds,
+        peers: parseInt(item.leechers || '0', 10) || 0,
+        sizeBytes,
+        magnet: buildMagnet(hash, name)
+      });
+    }
+    debug.count = out.length;
+    return { items: out, debug };
+  } catch (e) {
+    debug.error = e?.message || String(e);
+    return { items: [], debug };
+  }
+}
+
+// ============ BUILD STREAMS (UNIFIED) ============
 function buildStreams(items) {
   const seen = new Set();
   const unique = [];
@@ -120,6 +225,7 @@ function buildStreams(items) {
   }
   if (!unique.length) return [];
 
+  // Mataas na seeds muna; pag pantay, mas maliit na size muna
   unique.sort((a, b) => b.seeds - a.seeds || a.sizeBytes - b.sizeBytes);
 
   return unique.map(item => {
@@ -133,7 +239,8 @@ function buildStreams(items) {
     if (/\bDTS\b/i.test(item.filename)) extras.push('DTS');
     if (/\b5\.1\b/i.test(item.filename)) extras.push('5.1');
 
-    const titleLine = '🎬 ' + item.filename;
+    const srcEmoji = item.source === 'TPB' ? '☠️' : '🎬';
+    const titleLine = srcEmoji + ' ' + item.filename;
     const qualityLine = '🔥 ' + QUALITY_LABEL + (extras.length ? ' | ' + extras.join(' | ') : '');
     const statsLine = '🌱 ' + item.seeds + ' | 💾 ' + sizeGB + ' GB | 🔗 ' + item.source;
     const description = titleLine + '\n' + qualityLine + '\n' + statsLine;
@@ -150,29 +257,35 @@ function buildStreams(items) {
   });
 }
 
-// ============ ID PARSER ============
-function parseId(id) {
-  const parts = String(id).split(':');
-  return { imdbId: parts[0] };
-}
-
 // ============ STREAM HANDLER ============
 async function handleStream(type, id) {
-  // Movies lang ang supported
-  if (type !== 'movie') {
-    return { streams: [], _debug: { error: 'series not supported', type, id } };
+  if (type !== 'movie' && type !== 'series') {
+    return { streams: [], _debug: { error: 'unsupported type', type, id } };
   }
 
-  const { imdbId } = parseId(id);
+  const { imdbId, season, episode } = parseImdbFromId(id);
   if (!imdbId || !/^tt\d+$/.test(imdbId)) {
     return { streams: [], _debug: { error: 'invalid imdb', id } };
   }
 
-  const allDebug = { type, id, imdbId, sources: [] };
-  const ytsResult = await fetchYTS(imdbId);
-  allDebug.sources.push(ytsResult.debug);
+  const isMovie = type === 'movie';
+  const mediaType = isMovie ? 'movie' : 'tv';
 
-  const streams = buildStreams(ytsResult.items);
+  const allDebug = { type, id, imdbId, season, episode, sources: [] };
+
+  // YTS lang para sa movies. TPB para sa movies at series.
+  const tasks = [
+    fetchTPB(imdbId, mediaType, season, episode)
+  ];
+  if (isMovie) tasks.unshift(fetchYTS(imdbId));
+
+  const results = await Promise.all(tasks);
+  for (const r of results) allDebug.sources.push(r.debug);
+
+  const merged = results.flatMap(r => r.items);
+  const streams = buildStreams(merged);
+  allDebug.total = streams.length;
+
   return { streams, _debug: allDebug };
 }
 
