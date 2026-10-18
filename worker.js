@@ -1,5 +1,5 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v3.3.0)
+// NUVIO TORRENTS — Cloudflare Worker Addon (v3.3.1)
 // Movies: VIDY (direct) + YTS (1080p, min 15 seeds) + TPB (1080p, min 15 seeds)
 // Series: VIDY (direct) + TPB only (S01E01, 1080p, min 15 seeds)
 // Sorting: VIDY muna, tapos YTS, tapos TPB. Within each: seeds desc, size asc.
@@ -50,7 +50,7 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '3.3.0',
+  version: '3.3.1',
   name: 'MobiFlix',
   description: 'Vidy + YTS + The Pirate Bay — 1080p, minimum 15 seeders. Movies & series.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
@@ -304,28 +304,9 @@ function buildVidySourcesUrl(region, mediaType, tmdbId, seed, season, episode) {
   return VIDY_API_BASE + '/' + region + '/sources?' + query;
 }
 
-// Kunin ang totoong file size via HEAD (Content-Length). Fallback = null.
-async function fetchContentLength(url) {
-  try {
-    const res = await vWithTimeout(
-      fetch(url, {
-        method: 'HEAD',
-        headers: { 'User-Agent': VIDY_UA, 'Referer': VIDY_BASE_URL }
-      }),
-      6000
-    );
-    if (!res.ok) return null;
-    const len = res.headers.get('content-length');
-    const n = parseInt(len || '0', 10);
-    return n > 0 ? n : null;
-  } catch {
-    return null;
-  }
-}
-
 // ============ SOURCE: VIDY (MOVIES + SERIES) ============
 async function fetchVidy(tmdbId, mediaType, season, episode, tmdbInfo) {
-  const debug = { source: 'VIDY', tmdbId, mediaType, count: 0, error: null };
+  const debug = { source: 'VIDY', tmdbId, mediaType, regions: [], count: 0, error: null };
   try {
     if (!tmdbId) {
       debug.error = 'no tmdb id';
@@ -343,38 +324,36 @@ async function fetchVidy(tmdbId, mediaType, season, episode, tmdbInfo) {
     const seen = new Set();
 
     for (const region of regions) {
+      const regionDebug = { region, status: 'pending', sourcesFound: 0, wanted1080p: 0, error: null };
       try {
         const seed = await fetchVidySeed(tmdbId);
         const url = buildVidySourcesUrl(region, mediaType, tmdbId, seed, season, episode);
         const encryptedBody = await vFetchText(url, 12000);
-        const payload = JSON.parse(decryptPayload(encryptedBody, seed, tmdbId));
+        
+        let payload;
+        try {
+          payload = JSON.parse(decryptPayload(encryptedBody, seed, tmdbId));
+        } catch (decErr) {
+          regionDebug.error = 'decrypt failed: ' + decErr.message;
+          debug.regions.push(regionDebug);
+          continue;
+        }
+
+        regionDebug.status = 'decrypted';
+        regionDebug.sourcesFound = (payload.sources || []).length;
 
         const sources = collectWantedSources(payload.sources || []);
+        regionDebug.wanted1080p = sources.length;
         const subtitles = normalizeSubtitles(payload.subtitles || []);
         const providerName = region.toUpperCase();
-
-        // Parallel na HEAD requests para kunin totoong size
-        const sizeLookups = await Promise.all(
-          sources.map(s => fetchContentLength(s.url))
-        );
 
         sources.forEach(({ url: srcUrl, height }, index) => {
           if (seen.has(srcUrl)) return;
           seen.add(srcUrl);
 
-          // Option B: fake seeders (para magmukhang legit)
           const fakeSeeders = 100 + ((index * 13) % 800);
-
-          // Totoong size kung nakuha, fallback sa fake
-          const realSize = sizeLookups[index];
-          const sizeBytes = realSize && realSize > 0
-            ? realSize
-            : Math.floor((1.2 + (index * 0.4)) * 1073741824);
-
-          // Totoong title galing TMDB (kasama year kung meron)
-          const displayTitle = title
-            ? (year ? title + ' (' + year + ')' : title)
-            : providerName;
+          const sizeBytes = Math.floor((1.2 + (index * 0.4)) * 1073741824);
+          const displayTitle = title ? (year ? title + ' (' + year + ')' : title) : providerName;
 
           out.push({
             source: 'VIDY',
@@ -392,8 +371,9 @@ async function fetchVidy(tmdbId, mediaType, season, episode, tmdbInfo) {
           });
         });
       } catch (e) {
-        // isang region lang ang fail, tuloy pa rin sa iba
+        regionDebug.error = e?.message || String(e);
       }
+      debug.regions.push(regionDebug);
     }
 
     debug.count = out.length;
@@ -518,7 +498,6 @@ function buildStreams(items) {
   }
   if (!unique.length) return [];
 
-  // VIDY muna, tapos YTS, tapos TPB. Within each: seeds desc, then size asc.
   unique.sort((a, b) =>
     (a.sourceRank - b.sourceRank) ||
     (b.seeds - a.seeds) ||
@@ -575,7 +554,6 @@ async function handleStream(type, id) {
 
   const allDebug = { type, id, imdbId, season, episode, sources: [] };
 
-  // Kunin muna TMDB info (kailangan ng Vidy + TPB)
   const tmdbInfo = await getTmdbInfo(imdbId, mediaType)
     .catch(() => ({ title: '', year: '', tmdbId: null }));
 
