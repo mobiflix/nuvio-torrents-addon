@@ -1,8 +1,5 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v3.3.2)
-// Movies: VIDY (direct) + YTS (1080p, min 15 seeds) + TPB (1080p, min 15 seeds)
-// Series: VIDY (direct) + TPB only (S01E01, 1080p, min 15 seeds)
-// Sorting: VIDY muna, tapos YTS, tapos TPB. Within each: seeds desc, size asc.
+// NUVIO TORRENTS — Cloudflare Worker Addon (v3.3.3 - KV Cached)
 // ============================================================
 
 const YTS_API_BASE = 'https://movies-api.accel.li/api/v2';
@@ -10,7 +7,6 @@ const TPB_API_BASE = 'https://apibay.org';
 const TMDB_API_KEY = 'e0a7266a5d0e95c36475f349d8bc0a5a';
 const TMDB_BASE = 'https://api.themoviedb.org/3';
 
-// Vidy constants
 const VIDY_BASE_URL = 'https://www.vidy.st/';
 const VIDY_API_BASE = 'https://api.wecollege.net';
 const VIDY_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36';
@@ -19,7 +15,6 @@ const MIN_SEEDS_MOVIE = 15;
 const MIN_SEEDS_SERIES = 15;
 const QUALITY_LABEL = '1080p';
 
-// Source priority: mas maliit = mauuna
 const SOURCE_RANK = { VIDY: 0, YTS: 1, TPB: 2 };
 
 const HEADERS = {
@@ -47,10 +42,9 @@ const CORS = {
   'Content-Type': 'application/json'
 };
 
-// ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '3.3.2',
+  version: '3.3.3',
   name: 'MobiFlix',
   description: 'Vidy + YTS + The Pirate Bay — 1080p, minimum 15 seeders. Movies & series.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
@@ -66,7 +60,6 @@ const MANIFEST = {
   }
 };
 
-// ============ HELPERS ============
 function buildMagnet(hash, name) {
   if (!hash) return '';
   const trackers = TRACKERS.map(t => '&tr=' + encodeURIComponent(t)).join('');
@@ -100,7 +93,6 @@ async function fetchJson(url) {
   return res.json();
 }
 
-// ============ TMDB ============
 async function getTmdbInfo(imdbId, type) {
   const findUrl = TMDB_BASE + '/find/' + imdbId +
     '?api_key=' + TMDB_API_KEY + '&language=en-US&external_source=imdb_id';
@@ -123,7 +115,6 @@ async function getTmdbInfo(imdbId, type) {
   };
 }
 
-// ============ VIDY HELPERS (ported from vidy.js) ============
 function vWithTimeout(promise, timeoutMs) {
   return new Promise((resolve, reject) => {
     const timerId = setTimeout(() => reject(new Error('timeout')), timeoutMs);
@@ -176,9 +167,7 @@ function decodeBase64Url(encoded) {
   return bytes.subarray(0, byteCount);
 }
 
-function multiplyUint32(a, b) {
-  return Math.imul(a, b) >>> 0;
-}
+function multiplyUint32(a, b) { return Math.imul(a, b) >>> 0; }
 
 function rotateLeft32(value, shift) {
   const amount = shift & 31;
@@ -207,7 +196,6 @@ function hashFnv1a(text) {
 function generateKeystream(seed, tmdbId, length) {
   const cells = new Uint32Array(61);
   const isCellInitialized = new Uint8Array(61);
-
   let seedState = avalanche32((hashFnv1a(seed) ^ avalanche32((tmdbId >>> 0) ^ 0x9E3779B9)) >>> 0);
 
   for (let round = 0; round < 8; round++) {
@@ -232,11 +220,9 @@ function generateKeystream(seed, tmdbId, length) {
       rotateLeft32((combined + word) >>> 0, 31 & cellIndex) ^
       rotateLeft32(word, 31 & ((cellIndex * 7) & 31))
     ) >>> 0;
-
     word = avalanche32((scrambled + 0x9E3779B9) >>> 0);
     cells[cellIndex] = word;
     isCellInitialized[cellIndex] = 1;
-
     keystream[offset++] = word & 0xFF;
     if (offset < length) keystream[offset++] = (word >>> 8) & 0xFF;
     if (offset < length) keystream[offset++] = (word >>> 16) & 0xFF;
@@ -253,13 +239,11 @@ function hasPayloadMagic(bytes) {
 function decryptPayload(encodedCiphertext, seed, tmdbId) {
   const bytes = decodeBase64Url(encodedCiphertext);
   if (bytes.length < 4) throw new Error('payload too short');
-
   const keystream = generateKeystream(seed, tmdbId, bytes.length);
   for (let index = 0; index < bytes.length; index++) {
     bytes[index] ^= keystream[index];
   }
   if (!hasPayloadMagic(bytes)) throw new Error('bad seed or tampered payload');
-
   return new TextDecoder('utf-8').decode(bytes.subarray(4));
 }
 
@@ -304,9 +288,10 @@ function buildVidySourcesUrl(region, mediaType, tmdbId, seed, season, episode) {
   return VIDY_API_BASE + '/' + region + '/sources?' + query;
 }
 
-// ============ SOURCE: VIDY (MOVIES + SERIES) ============
-async function fetchVidy(tmdbId, mediaType, season, episode, tmdbInfo) {
-  const debug = { source: 'VIDY', tmdbId, mediaType, regions: [], count: 0, error: null };
+// ============ SOURCE: VIDY (MOVIES + SERIES) with KV CACHE ============
+async function fetchVidy(tmdbId, mediaType, season, episode, tmdbInfo, env) {
+  const debug = { source: 'VIDY', tmdbId, mediaType, cacheHit: false, regions: [], count: 0, error: null };
+  
   try {
     if (!tmdbId) {
       debug.error = 'no tmdb id';
@@ -317,6 +302,18 @@ async function fetchVidy(tmdbId, mediaType, season, episode, tmdbInfo) {
       return { items: [], debug };
     }
 
+    // 1. Subukan muna sa CACHE
+    const cacheKey = `vidy_${mediaType}_${tmdbId}_${season || '0'}_${episode || '0'}`;
+    if (env && env.VIDY_KV) {
+      const cachedData = await env.VIDY_KV.get(cacheKey, 'json');
+      if (cachedData && cachedData.items) {
+        debug.cacheHit = true;
+        debug.count = cachedData.items.length;
+        return { items: cachedData.items, debug };
+      }
+    }
+
+    // 2. Kung wala sa cache, kumuha sa Vidy
     const title = tmdbInfo?.title || '';
     const year = tmdbInfo?.year || '';
     const regions = ['miami', 'boise'];
@@ -325,12 +322,7 @@ async function fetchVidy(tmdbId, mediaType, season, episode, tmdbInfo) {
 
     for (let i = 0; i < regions.length; i++) {
       const region = regions[i];
-      
-      // MAG-ANTALA NG 1.5 SECONDS BAGO MAG-REQUEST SA SUSUNOD NA REGION
-      // Para hindi tayo ma-flag na spam at hindi tumama sa 429.
-      if (i > 0) {
-        await new Promise(resolve => setTimeout(resolve, 1500));
-      }
+      if (i > 0) await new Promise(resolve => setTimeout(resolve, 1000));
 
       const regionDebug = { region, status: 'pending', sourcesFound: 0, wanted1080p: 0, error: null };
       try {
@@ -344,12 +336,11 @@ async function fetchVidy(tmdbId, mediaType, season, episode, tmdbInfo) {
         } catch (decErr) {
           regionDebug.error = 'decrypt failed: ' + decErr.message;
           debug.regions.push(regionDebug);
-          continue; // Skip na lang kung fail, huwag na ulitin
+          continue;
         }
 
         regionDebug.status = 'decrypted';
         regionDebug.sourcesFound = (payload.sources || []).length;
-
         const sources = collectWantedSources(payload.sources || []);
         regionDebug.wanted1080p = sources.length;
         const subtitles = normalizeSubtitles(payload.subtitles || []);
@@ -385,6 +376,12 @@ async function fetchVidy(tmdbId, mediaType, season, episode, tmdbInfo) {
     }
 
     debug.count = out.length;
+
+    // 3. I-save sa KV Cache kung may nakuha (valid for 2 hours)
+    if (env && env.VIDY_KV && out.length > 0) {
+      await env.VIDY_KV.put(cacheKey, JSON.stringify({ items: out }), { expirationTtl: 7200 });
+    }
+
     return { items: out, debug };
   } catch (e) {
     debug.error = e?.message || String(e);
@@ -494,7 +491,7 @@ async function fetchTPB(imdbId, mediaType, season, episode, preInfo) {
   }
 }
 
-// ============ BUILD STREAMS (UNIFIED) ============
+// ============ BUILD STREAMS ============
 function buildStreams(items) {
   const seen = new Set();
   const unique = [];
@@ -534,9 +531,7 @@ function buildStreams(items) {
       title: description,
       description: description,
       url: item.directUrl || item.magnet,
-      behaviorHints: {
-        bingeGroup: 'nuvio-torrents-' + item.source + '-1080p'
-      }
+      behaviorHints: { bingeGroup: 'nuvio-torrents-' + item.source + '-1080p' }
     };
 
     if (item.headers) stream.headers = item.headers;
@@ -547,7 +542,7 @@ function buildStreams(items) {
 }
 
 // ============ STREAM HANDLER ============
-async function handleStream(type, id) {
+async function handleStream(type, id, env) {
   if (type !== 'movie' && type !== 'series') {
     return { streams: [], _debug: { error: 'unsupported type', type, id } };
   }
@@ -566,7 +561,7 @@ async function handleStream(type, id) {
     .catch(() => ({ title: '', year: '', tmdbId: null }));
 
   const tasks = [
-    fetchVidy(tmdbInfo.tmdbId, mediaType, season, episode, tmdbInfo),
+    fetchVidy(tmdbInfo.tmdbId, mediaType, season, episode, tmdbInfo, env),
     fetchTPB(imdbId, mediaType, season, episode, tmdbInfo)
   ];
   if (isMovie) tasks.unshift(fetchYTS(imdbId));
@@ -583,7 +578,7 @@ async function handleStream(type, id) {
 
 // ============ ROUTER ============
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -600,7 +595,7 @@ export default {
       const type = debugMatch[1];
       const id = decodeURIComponent(debugMatch[2]);
       try {
-        const result = await handleStream(type, id);
+        const result = await handleStream(type, id, env);
         return new Response(JSON.stringify(result, null, 2), { headers: CORS });
       } catch (e) {
         return new Response(JSON.stringify({ error: e.message, stack: e.stack }, null, 2), { headers: CORS });
@@ -612,7 +607,7 @@ export default {
       const type = streamMatch[1];
       const id = decodeURIComponent(streamMatch[2]);
       try {
-        const result = await handleStream(type, id);
+        const result = await handleStream(type, id, env);
         return new Response(JSON.stringify({ streams: result.streams }), { headers: CORS });
       } catch (e) {
         return new Response(JSON.stringify({ streams: [], error: e.message }), { headers: CORS });
