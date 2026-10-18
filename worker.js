@@ -1,5 +1,5 @@
 // ============================================================
-// NUVIO TORRENTS — Cloudflare Worker Addon (v3.3.1)
+// NUVIO TORRENTS — Cloudflare Worker Addon (v3.3.2)
 // Movies: VIDY (direct) + YTS (1080p, min 15 seeds) + TPB (1080p, min 15 seeds)
 // Series: VIDY (direct) + TPB only (S01E01, 1080p, min 15 seeds)
 // Sorting: VIDY muna, tapos YTS, tapos TPB. Within each: seeds desc, size asc.
@@ -50,7 +50,7 @@ const CORS = {
 // ============ MANIFEST ============
 const MANIFEST = {
   id: 'community.nuvio.torrents',
-  version: '3.3.1',
+  version: '3.3.2',
   name: 'MobiFlix',
   description: 'Vidy + YTS + The Pirate Bay — 1080p, minimum 15 seeders. Movies & series.',
   logo: 'https://em-content.zobj.net/source/apple/391/eagle_1f985.png',
@@ -323,7 +323,15 @@ async function fetchVidy(tmdbId, mediaType, season, episode, tmdbInfo) {
     const out = [];
     const seen = new Set();
 
-    for (const region of regions) {
+    for (let i = 0; i < regions.length; i++) {
+      const region = regions[i];
+      
+      // MAG-ANTALA NG 1.5 SECONDS BAGO MAG-REQUEST SA SUSUNOD NA REGION
+      // Para hindi tayo ma-flag na spam at hindi tumama sa 429.
+      if (i > 0) {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+
       const regionDebug = { region, status: 'pending', sourcesFound: 0, wanted1080p: 0, error: null };
       try {
         const seed = await fetchVidySeed(tmdbId);
@@ -336,7 +344,7 @@ async function fetchVidy(tmdbId, mediaType, season, episode, tmdbInfo) {
         } catch (decErr) {
           regionDebug.error = 'decrypt failed: ' + decErr.message;
           debug.regions.push(regionDebug);
-          continue;
+          continue; // Skip na lang kung fail, huwag na ulitin
         }
 
         regionDebug.status = 'decrypted';
