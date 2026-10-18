@@ -1,0 +1,17 @@
+{
+  "id": "community.nuvio.torrents",
+  "version": "3.2.1",
+  "name": "MobiFlix",
+  "description": "YTS + The Pirate Bay torrents — 1080p, minimum 15 seeders. Movies & series.",
+  "logo": "https://em-content.zobj.net/source/apple/391/eagle_1f985.png",
+  "author": "Nuvio Team",
+  "types": ["movie", "series"],
+  "idPrefixes": ["tt"],
+  "catalogs": [],
+  "resources": ["stream"],
+  "behaviorHints": {
+    "configurable": false,
+    "configurationRequired": false,
+    "logging": false
+  }
+}
